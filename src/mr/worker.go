@@ -48,6 +48,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		ok := call("Coordinator.Distribute", &args, &reply)
 		nReduce := int(reply.NReduce)
 		if ok {
+			fmt.Printf("stage %v\n", reply.State)
 
 			switch reply.State {
 			case Map, WaitingMap:
@@ -58,6 +59,8 @@ func Worker(mapf func(string, string) []KeyValue,
 				// 等待
 				if filename == "" {
 					time.Sleep(1 * time.Second)
+					// 未处理文件
+					args.File = ""
 					break
 				}
 
@@ -93,7 +96,7 @@ func Worker(mapf func(string, string) []KeyValue,
 
 				for i := 0; i < nReduce; i++ {
 					tmpFiles[i].Close()
-					newName := fmt.Sprintf("mr-%d-%d", mapCount, nReduce)
+					newName := fmt.Sprintf("mr-%d-%d", mapCount, i)
 					err := os.Rename(tmpFiles[i].Name(), newName)
 					if err != nil {
 						log.Fatalf("cannot rename temp File: %v", err)
@@ -106,10 +109,13 @@ func Worker(mapf func(string, string) []KeyValue,
 			case Reduce, WaitingReduce:
 
 				reduceCount := reply.ReduceCount
+				fmt.Printf("reduce count %v\n", reduceCount)
 
 				// 等待
 				if reduceCount == 0 {
 					time.Sleep(1 * time.Second)
+					// 未处理 reduceCount
+					args.ReduceCount = 0
 					break
 				}
 
@@ -123,8 +129,9 @@ func Worker(mapf func(string, string) []KeyValue,
 				kva := []KeyValue{}
 				for _, file := range files {
 					f, err := os.Open(file)
+					fmt.Printf("processing file %v", file)
 					if err != nil {
-						log.Fatalf("cannot open  %v", file)
+						log.Fatalf("cannot open %v", file)
 					}
 
 					decoder := json.NewDecoder(f)
@@ -167,6 +174,17 @@ func Worker(mapf func(string, string) []KeyValue,
 				}
 
 				ofile.Close()
+
+				// 删除所有中间文件
+				for _, file := range files {
+					err := os.Remove(file)
+					if err != nil {
+						log.Fatalf("cannot remove file %v", file)
+					}
+				}
+
+				// 处理 reduceCount 完成
+				args.ReduceCount = reduceCount
 
 			case Done:
 				fmt.Printf("finish!\n")

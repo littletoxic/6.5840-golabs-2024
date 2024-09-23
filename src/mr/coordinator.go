@@ -102,7 +102,7 @@ func (c *Coordinator) Distribute(args *Args, reply *Reply) error {
 			reduceCount := c.reduceCount.Add(1)
 
 			// 任务发完
-			if reduceCount >= c.nReduce {
+			if reduceCount > c.nReduce {
 				c.state.CompareAndSwap(Reduce, WaitingReduce)
 				break
 			}
