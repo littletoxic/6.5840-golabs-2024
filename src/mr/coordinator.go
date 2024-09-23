@@ -38,7 +38,7 @@ type MapState struct {
 // Your code here -- RPC handlers for the worker to call.
 func (c *Coordinator) Distribute(args *Args, reply *Reply) error {
 	valid := false
-	reply.nReduce = c.nReduce
+	reply.NReduce = c.nReduce
 
 	for !valid {
 		switch c.state.Load() {
@@ -60,19 +60,19 @@ func (c *Coordinator) Distribute(args *Args, reply *Reply) error {
 			mapCount := c.mapCount.Add(1) - 1
 
 			c.statesLock.Lock()
-			delete(c.mapStates, args.file)
-			c.mapStates[reply.file] = MapState{time.Now(), mapCount}
+			delete(c.mapStates, args.File)
+			c.mapStates[reply.File] = MapState{time.Now(), mapCount}
 			c.statesLock.Unlock()
 
-			reply.mapCount = mapCount
-			reply.file = file
-			reply.state = Map
+			reply.MapCount = mapCount
+			reply.File = file
+			reply.State = Map
 			valid = true
 
 		case WaitingMap:
 
 			c.statesLock.Lock()
-			delete(c.mapStates, args.file)
+			delete(c.mapStates, args.File)
 
 			var file string
 			var mapCount int64
@@ -91,10 +91,10 @@ func (c *Coordinator) Distribute(args *Args, reply *Reply) error {
 			}
 			c.statesLock.Unlock()
 
-			reply.mapCount = mapCount
+			reply.MapCount = mapCount
 			// 空表示等待
-			reply.file = file
-			reply.state = WaitingMap
+			reply.File = file
+			reply.State = WaitingMap
 			valid = true
 
 		case Reduce:
@@ -111,14 +111,14 @@ func (c *Coordinator) Distribute(args *Args, reply *Reply) error {
 			c.reduceStates[reduceCount] = time.Now()
 			c.statesLock.Unlock()
 
-			reply.reduceCount = reduceCount
-			reply.state = Reduce
+			reply.ReduceCount = reduceCount
+			reply.State = Reduce
 			valid = true
 
 		case WaitingReduce:
 
 			c.statesLock.Lock()
-			delete(c.reduceStates, args.reduceCount)
+			delete(c.reduceStates, args.ReduceCount)
 
 			var reduceCount int64
 			for k, v := range c.reduceStates {
@@ -136,12 +136,12 @@ func (c *Coordinator) Distribute(args *Args, reply *Reply) error {
 			c.statesLock.Unlock()
 
 			// 0 表示等待
-			reply.reduceCount = reduceCount
-			reply.state = WaitingReduce
+			reply.ReduceCount = reduceCount
+			reply.State = WaitingReduce
 			valid = true
 
 		case Done:
-			reply.state = Done
+			reply.State = Done
 			valid = true
 
 		}
@@ -179,7 +179,7 @@ func (c *Coordinator) Done() bool {
 
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
-// nReduce is the number of reduce tasks to use.
+// NReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 

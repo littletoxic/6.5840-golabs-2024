@@ -9,40 +9,27 @@ package mr
 import "os"
 import "strconv"
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
-
-type ExampleArgs struct {
-	X int
-}
-
-type ExampleReply struct {
-	Y int
-}
-
 // Add your RPC definitions here.
 type Args struct {
 	// Map 和 WaitingMap 阶段使用
-	file string
+	File string
 
 	// Reduce 阶段
-	reduceCount int64
+	ReduceCount int64
 }
 
 type Reply struct {
 	// Map 和 WaitingMap 阶段使用
-	file     string
-	mapCount int64
+	File     string
+	MapCount int64
 
 	// Reduce 阶段
 	// 从 1 开始，worker 创建文件时减一
-	reduceCount int64
+	ReduceCount int64
 
 	// 全局
-	nReduce int64
-	state   int64
+	NReduce int64
+	State   int64
 }
 
 const (

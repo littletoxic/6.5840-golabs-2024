@@ -46,14 +46,14 @@ func Worker(mapf func(string, string) []KeyValue,
 		reply := Reply{}
 
 		ok := call("Coordinator.Distribute", &args, &reply)
-		nReduce := int(reply.nReduce)
+		nReduce := int(reply.NReduce)
 		if ok {
 
-			switch reply.state {
+			switch reply.State {
 			case Map, WaitingMap:
 
-				filename := reply.file
-				mapCount := reply.mapCount
+				filename := reply.File
+				mapCount := reply.MapCount
 
 				// 等待
 				if filename == "" {
@@ -77,12 +77,12 @@ func Worker(mapf func(string, string) []KeyValue,
 				for i := 0; i < nReduce; i++ {
 					tmpFiles[i], err = os.CreateTemp(".", "tmp-mr-*")
 					if err != nil {
-						log.Fatalf("cannot create temp file: %v", err)
+						log.Fatalf("cannot create temp File: %v", err)
 					}
 					encoders[i] = json.NewEncoder(tmpFiles[i])
 				}
 
-				// 将 map 的结果按 nReduce 分片写入文件
+				// 将 map 的结果按 NReduce 分片写入文件
 				for _, kv := range kva {
 					reduce := ihash(kv.Key) % nReduce
 					err := encoders[reduce].Encode(&kv)
@@ -96,16 +96,16 @@ func Worker(mapf func(string, string) []KeyValue,
 					newName := fmt.Sprintf("mr-%d-%d", mapCount, nReduce)
 					err := os.Rename(tmpFiles[i].Name(), newName)
 					if err != nil {
-						log.Fatalf("cannot rename temp file: %v", err)
+						log.Fatalf("cannot rename temp File: %v", err)
 					}
 				}
 
-				// 处理 file 完成
-				args.file = reply.file
+				// 处理 File 完成
+				args.File = reply.File
 
 			case Reduce, WaitingReduce:
 
-				reduceCount := reply.reduceCount
+				reduceCount := reply.ReduceCount
 
 				// 等待
 				if reduceCount == 0 {
@@ -119,7 +119,7 @@ func Worker(mapf func(string, string) []KeyValue,
 					log.Fatalf("error finding files: %v", err)
 				}
 
-				// 读取 reduceCount 要处理的所有文件
+				// 读取 ReduceCount 要处理的所有文件
 				kva := []KeyValue{}
 				for _, file := range files {
 					f, err := os.Open(file)
