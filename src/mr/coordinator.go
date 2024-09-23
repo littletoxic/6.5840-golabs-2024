@@ -2,6 +2,7 @@ package mr
 
 import (
 	"log"
+	"path/filepath"
 )
 import "net"
 import "os"
@@ -61,7 +62,7 @@ func (c *Coordinator) Distribute(args *Args, reply *Reply) error {
 
 			c.statesLock.Lock()
 			delete(c.mapStates, args.File)
-			c.mapStates[reply.File] = MapState{time.Now(), mapCount}
+			c.mapStates[file] = MapState{time.Now(), mapCount}
 			c.statesLock.Unlock()
 
 			reply.MapCount = mapCount
@@ -76,12 +77,12 @@ func (c *Coordinator) Distribute(args *Args, reply *Reply) error {
 
 			var file string
 			var mapCount int64
-			for k, v := range c.mapStates {
+			for f, state := range c.mapStates {
 				// 超时
-				if time.Now().After(v.start.Add(time.Second * 10)) {
-					file = k
-					mapCount := v.mapCount
-					c.mapStates[k] = MapState{time.Now(), mapCount}
+				if time.Now().After(state.start.Add(time.Second * 10)) {
+					file = f
+					mapCount := state.mapCount
+					c.mapStates[f] = MapState{time.Now(), mapCount}
 					break
 				}
 			}
@@ -122,11 +123,11 @@ func (c *Coordinator) Distribute(args *Args, reply *Reply) error {
 			delete(c.reduceStates, args.ReduceCount)
 
 			var reduceCount int64
-			for k, v := range c.reduceStates {
+			for i, t := range c.reduceStates {
 				// 超时
-				if time.Now().After(v.Add(time.Second * 10)) {
-					reduceCount = k
-					c.reduceStates[k] = time.Now()
+				if time.Now().After(t.Add(time.Second * 10)) {
+					reduceCount = i
+					c.reduceStates[i] = time.Now()
 					break
 				}
 			}
@@ -170,6 +171,26 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
 	if c.state.Load() == Done {
+
+		files, err := filepath.Glob("mr-*-inter")
+		if err != nil {
+			log.Printf("error finding files: %v", err)
+		}
+
+		tmp, err := filepath.Glob("tmp-mr-*")
+		if err != nil {
+			log.Printf("error finding files: %v", err)
+		}
+
+		files = append(files, tmp...)
+
+		for _, file := range files {
+			err := os.Remove(file)
+			if err != nil {
+				log.Printf("error removing file %s: %v", file, err)
+			}
+		}
+
 		time.Sleep(3 * time.Second)
 		return true
 	}

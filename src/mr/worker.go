@@ -74,6 +74,7 @@ func Worker(mapf func(string, string) []KeyValue,
 				file.Close()
 				kva := mapf(filename, string(content))
 
+				// 创建 nReduce 个临时文件
 				tmpFiles := make([]*os.File, nReduce)
 				encoders := make([]*json.Encoder, nReduce)
 				for i := 0; i < nReduce; i++ {
@@ -178,13 +179,7 @@ func Worker(mapf func(string, string) []KeyValue,
 					log.Fatalf("cannot rename temp File: %v", err)
 				}
 
-				// 删除所有中间文件
-				for _, file := range files {
-					err := os.Remove(file)
-					if err != nil {
-						log.Fatalf("cannot remove file %v", file)
-					}
-				}
+				// 所有中间文件在 coordinator.go 中删除
 
 				// 处理 reduceCount 完成
 				args.ReduceCount = reduceCount
