@@ -9,6 +9,7 @@ import (
 	"net/rpc"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"time"
 )
@@ -48,7 +49,6 @@ func Worker(mapf func(string, string) []KeyValue,
 		ok := call("Coordinator.Distribute", &args, &reply)
 		nReduce := int(reply.NReduce)
 		if ok {
-			fmt.Printf("stage %v\n", reply.State)
 
 			switch reply.State {
 			case Map, WaitingMap:
@@ -109,7 +109,6 @@ func Worker(mapf func(string, string) []KeyValue,
 			case Reduce, WaitingReduce:
 
 				reduceCount := reply.ReduceCount
-				fmt.Printf("reduce count %v\n", reduceCount)
 
 				// 等待
 				if reduceCount == 0 {
@@ -119,17 +118,31 @@ func Worker(mapf func(string, string) []KeyValue,
 					break
 				}
 
-				pattern := fmt.Sprintf("mr-*-%d", reduceCount-1)
-				files, err := filepath.Glob(pattern)
+				// 找到所有中间文件
+				pattern := fmt.Sprintf(`mr-\d+-%d`, reduceCount-1)
+				re, err := regexp.Compile(pattern)
 				if err != nil {
-					log.Fatalf("error finding files: %v", err)
+					log.Fatalf("error compiling regex: %v", err)
+				}
+
+				var files []string
+				err = filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
+					if err != nil {
+						return err
+					}
+					if !info.IsDir() && re.MatchString(info.Name()) {
+						files = append(files, path)
+					}
+					return nil
+				})
+				if err != nil {
+					log.Fatalf("error walking the path: %v", err)
 				}
 
 				// 读取 ReduceCount 要处理的所有文件
 				kva := []KeyValue{}
 				for _, file := range files {
 					f, err := os.Open(file)
-					fmt.Printf("processing file %v", file)
 					if err != nil {
 						log.Fatalf("cannot open %v", file)
 					}
@@ -187,7 +200,6 @@ func Worker(mapf func(string, string) []KeyValue,
 				args.ReduceCount = reduceCount
 
 			case Done:
-				fmt.Printf("finish!\n")
 				os.Exit(0)
 			}
 
