@@ -8,8 +8,18 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"path/filepath"
+	"sort"
 	"time"
 )
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -36,12 +46,14 @@ func Worker(mapf func(string, string) []KeyValue,
 		reply := Reply{}
 
 		ok := call("Coordinator.Distribute", &args, &reply)
+		nReduce := int(reply.nReduce)
 		if ok {
 
 			switch reply.state {
 			case Map, WaitingMap:
 
 				filename := reply.file
+				mapCount := reply.mapCount
 
 				// 等待
 				if filename == "" {
@@ -60,9 +72,9 @@ func Worker(mapf func(string, string) []KeyValue,
 				file.Close()
 				kva := mapf(filename, string(content))
 
-				tmpFiles := make([]*os.File, reply.nReduce)
-				encoders := make([]*json.Encoder, reply.nReduce)
-				for i := 0; i < reply.nReduce; i++ {
+				tmpFiles := make([]*os.File, nReduce)
+				encoders := make([]*json.Encoder, nReduce)
+				for i := 0; i < nReduce; i++ {
 					tmpFiles[i], err = os.CreateTemp(".", "tmp-mr-*")
 					if err != nil {
 						log.Fatalf("cannot create temp file: %v", err)
@@ -70,59 +82,103 @@ func Worker(mapf func(string, string) []KeyValue,
 					encoders[i] = json.NewEncoder(tmpFiles[i])
 				}
 
+				// 将 map 的结果按 nReduce 分片写入文件
 				for _, kv := range kva {
-					reduce := ihash(kv.Key) % reply.nReduce
+					reduce := ihash(kv.Key) % nReduce
 					err := encoders[reduce].Encode(&kv)
 					if err != nil {
 						log.Fatalf("cannot encode kv pair: %v", err)
 					}
 				}
 
-				for i := 0; i < reply.nReduce; i++ {
+				for i := 0; i < nReduce; i++ {
 					tmpFiles[i].Close()
-					newName := fmt.Sprintf("mr-%d-%d", reply.mapCount, reply.nReduce)
+					newName := fmt.Sprintf("mr-%d-%d", mapCount, nReduce)
 					err := os.Rename(tmpFiles[i].Name(), newName)
 					if err != nil {
 						log.Fatalf("cannot rename temp file: %v", err)
 					}
 				}
 
+				// 处理 file 完成
+				args.file = reply.file
+
+			case Reduce, WaitingReduce:
+
+				reduceCount := reply.reduceCount
+
+				// 等待
+				if reduceCount == 0 {
+					time.Sleep(1 * time.Second)
+					break
+				}
+
+				pattern := fmt.Sprintf("mr-*-%d", reduceCount-1)
+				files, err := filepath.Glob(pattern)
+				if err != nil {
+					log.Fatalf("error finding files: %v", err)
+				}
+
+				// 读取 reduceCount 要处理的所有文件
+				kva := []KeyValue{}
+				for _, file := range files {
+					f, err := os.Open(file)
+					if err != nil {
+						log.Fatalf("cannot open  %v", file)
+					}
+
+					decoder := json.NewDecoder(f)
+					var kv KeyValue
+					for decoder.More() {
+						if err := decoder.Decode(&kv); err != nil {
+							log.Fatalf("cannot decode kv pair: %v", err)
+						}
+						kva = append(kva, kv)
+					}
+
+					f.Close()
+				}
+
+				sort.Sort(ByKey(kva))
+
+				oname := fmt.Sprintf("mr-out-%d", reduceCount-1)
+				ofile, _ := os.Create(oname)
+
+				//
+				// call Reduce on each distinct key in intermediate[],
+				// and print the result to mr-out-0.
+				//
+				i := 0
+				for i < len(kva) {
+					j := i + 1
+					for j < len(kva) && kva[j].Key == kva[i].Key {
+						j++
+					}
+					values := []string{}
+					for k := i; k < j; k++ {
+						values = append(values, kva[k].Value)
+					}
+					output := reducef(kva[i].Key, values)
+
+					// this is the correct format for each line of Reduce output.
+					fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+
+					i = j
+				}
+
+				ofile.Close()
+
+			case Done:
+				fmt.Printf("finish!\n")
+				os.Exit(0)
 			}
 
 		} else {
 			fmt.Printf("call failed!\n")
+			os.Exit(1)
 		}
 	}
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
 
-}
-
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
-	}
 }
 
 // send an RPC request to the coordinator, wait for the response.

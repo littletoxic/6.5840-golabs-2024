@@ -1,6 +1,8 @@
 package mr
 
-import "log"
+import (
+	"log"
+)
 import "net"
 import "os"
 import "net/rpc"
@@ -12,14 +14,20 @@ import "sync/atomic"
 type Coordinator struct {
 	// Your definitions here.
 	// Map 和 WaitingMap 阶段
-	files      []string
-	mapStates  map[string]MapState
-	filesLock  sync.Mutex
-	statesLock sync.Mutex
-	mapCount   atomic.Int64
+	files     []string
+	mapStates map[string]MapState
+	filesLock sync.Mutex
+	mapCount  atomic.Int64
 
-	nReduce int
-	state   atomic.Int32
+	// Reduce 阶段
+	reduceStates map[int64]time.Time
+	reduceCount  atomic.Int64
+
+	// 全局
+	nReduce int64
+	// 每个阶段的 states 共用
+	statesLock sync.Mutex
+	state      atomic.Int64
 }
 
 type MapState struct {
@@ -79,7 +87,7 @@ func (c *Coordinator) Distribute(args *Args, reply *Reply) error {
 			}
 
 			if len(c.mapStates) == 0 {
-				c.state.CompareAndSwap(WaitingMap, 3)
+				c.state.CompareAndSwap(WaitingMap, Reduce)
 			}
 			c.statesLock.Unlock()
 
@@ -89,17 +97,57 @@ func (c *Coordinator) Distribute(args *Args, reply *Reply) error {
 			reply.state = WaitingMap
 			valid = true
 
+		case Reduce:
+
+			reduceCount := c.reduceCount.Add(1)
+
+			// 任务发完
+			if reduceCount >= c.nReduce {
+				c.state.CompareAndSwap(Reduce, WaitingReduce)
+				break
+			}
+
+			c.statesLock.Lock()
+			c.reduceStates[reduceCount] = time.Now()
+			c.statesLock.Unlock()
+
+			reply.reduceCount = reduceCount
+			reply.state = Reduce
+			valid = true
+
+		case WaitingReduce:
+
+			c.statesLock.Lock()
+			delete(c.reduceStates, args.reduceCount)
+
+			var reduceCount int64
+			for k, v := range c.reduceStates {
+				// 超时
+				if time.Now().After(v.Add(time.Second * 10)) {
+					reduceCount = k
+					c.reduceStates[k] = time.Now()
+					break
+				}
+			}
+
+			if len(c.mapStates) == 0 {
+				c.state.CompareAndSwap(WaitingReduce, Done)
+			}
+			c.statesLock.Unlock()
+
+			// 0 表示等待
+			reply.reduceCount = reduceCount
+			reply.state = WaitingReduce
+			valid = true
+
+		case Done:
+			reply.state = Done
+			valid = true
+
 		}
+
 	}
 
-	return nil
-}
-
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
 	return nil
 }
 
@@ -120,10 +168,13 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := false
+	if c.state.Load() == Done {
+		time.Sleep(3 * time.Second)
+		return true
+	}
 
 	// Your code here.
-	return ret
+	return false
 }
 
 // create a Coordinator.
@@ -134,7 +185,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	// Your code here.
 	c.files = files
-	c.nReduce = nReduce
+	c.nReduce = int64(nReduce)
 
 	c.server()
 	return &c

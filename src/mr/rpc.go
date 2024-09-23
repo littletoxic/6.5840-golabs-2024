@@ -24,20 +24,33 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 type Args struct {
+	// Map 和 WaitingMap 阶段使用
 	file string
+
+	// Reduce 阶段
+	reduceCount int64
 }
 
 type Reply struct {
+	// Map 和 WaitingMap 阶段使用
 	file     string
 	mapCount int64
 
-	nReduce int
-	state   int32
+	// Reduce 阶段
+	// 从 1 开始，worker 创建文件时减一
+	reduceCount int64
+
+	// 全局
+	nReduce int64
+	state   int64
 }
 
 const (
-	Map int32 = iota
+	Map int64 = iota
 	WaitingMap
+	Reduce
+	WaitingReduce
+	Done
 )
 
 // Cook up a unique-ish UNIX-domain socket name
