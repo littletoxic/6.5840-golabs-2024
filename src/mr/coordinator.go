@@ -130,7 +130,7 @@ func (c *Coordinator) Distribute(args *Args, reply *Reply) error {
 				}
 			}
 
-			if len(c.mapStates) == 0 {
+			if len(c.reduceStates) == 0 {
 				c.state.CompareAndSwap(WaitingReduce, Done)
 			}
 			c.statesLock.Unlock()

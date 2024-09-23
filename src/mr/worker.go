@@ -146,7 +146,10 @@ func Worker(mapf func(string, string) []KeyValue,
 
 				sort.Sort(ByKey(kva))
 
-				tofile, _ := os.CreateTemp(".", "tmp-mr-*")
+				tofile, err := os.CreateTemp(".", "tmp-mr-out-*")
+				if err != nil {
+					log.Fatalf("cannot create temp File: %v", err)
+				}
 				//
 				// call Reduce on each distinct key in intermediate[],
 				// and print the result to mr-out-0.
@@ -170,7 +173,10 @@ func Worker(mapf func(string, string) []KeyValue,
 				}
 				oname := fmt.Sprintf("mr-out-%d", reduceCount-1)
 				tofile.Close()
-				os.Rename(tofile.Name(), oname)
+				err = os.Rename(tofile.Name(), oname)
+				if err != nil {
+					log.Fatalf("cannot rename temp File: %v", err)
+				}
 
 				// 删除所有中间文件
 				for _, file := range files {
