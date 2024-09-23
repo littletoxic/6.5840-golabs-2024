@@ -81,7 +81,7 @@ func (c *Coordinator) Distribute(args *Args, reply *Reply) error {
 				// 超时
 				if time.Now().After(state.start.Add(time.Second * 10)) {
 					file = f
-					mapCount := state.mapCount
+					mapCount = state.mapCount
 					c.mapStates[f] = MapState{time.Now(), mapCount}
 					break
 				}
