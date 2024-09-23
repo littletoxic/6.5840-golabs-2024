@@ -9,7 +9,6 @@ import (
 	"net/rpc"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"time"
 )
@@ -96,7 +95,7 @@ func Worker(mapf func(string, string) []KeyValue,
 
 				for i := 0; i < nReduce; i++ {
 					tmpFiles[i].Close()
-					newName := fmt.Sprintf("mr-%d-%d", mapCount, i)
+					newName := fmt.Sprintf("mr-%d-%d-inter", mapCount, i)
 					err := os.Rename(tmpFiles[i].Name(), newName)
 					if err != nil {
 						log.Fatalf("cannot rename temp File: %v", err)
@@ -119,28 +118,14 @@ func Worker(mapf func(string, string) []KeyValue,
 				}
 
 				// 找到所有中间文件
-				pattern := fmt.Sprintf(`mr-\d+-%d`, reduceCount-1)
-				re, err := regexp.Compile(pattern)
+				pattern := fmt.Sprintf("mr-*-%d-inter", reduceCount-1)
+				files, err := filepath.Glob(pattern)
 				if err != nil {
-					log.Fatalf("error compiling regex: %v", err)
-				}
-
-				var files []string
-				err = filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
-					if err != nil {
-						return err
-					}
-					if !info.IsDir() && re.MatchString(info.Name()) {
-						files = append(files, path)
-					}
-					return nil
-				})
-				if err != nil {
-					log.Fatalf("error walking the path: %v", err)
+					log.Fatalf("error finding files: %v", err)
 				}
 
 				// 读取 ReduceCount 要处理的所有文件
-				kva := []KeyValue{}
+				var kva []KeyValue
 				for _, file := range files {
 					f, err := os.Open(file)
 					if err != nil {
@@ -161,9 +146,7 @@ func Worker(mapf func(string, string) []KeyValue,
 
 				sort.Sort(ByKey(kva))
 
-				oname := fmt.Sprintf("mr-out-%d", reduceCount-1)
-				ofile, _ := os.Create(oname)
-
+				tofile, _ := os.CreateTemp(".", "tmp-mr-*")
 				//
 				// call Reduce on each distinct key in intermediate[],
 				// and print the result to mr-out-0.
@@ -181,12 +164,13 @@ func Worker(mapf func(string, string) []KeyValue,
 					output := reducef(kva[i].Key, values)
 
 					// this is the correct format for each line of Reduce output.
-					fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+					fmt.Fprintf(tofile, "%v %v\n", kva[i].Key, output)
 
 					i = j
 				}
-
-				ofile.Close()
+				oname := fmt.Sprintf("mr-out-%d", reduceCount-1)
+				tofile.Close()
+				os.Rename(tofile.Name(), oname)
 
 				// 删除所有中间文件
 				for _, file := range files {
