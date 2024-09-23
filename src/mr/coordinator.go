@@ -184,7 +184,14 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
 	// Your code here.
+	// Map 和 WaitingMap 阶段
 	c.files = files
+	c.mapStates = make(map[string]MapState)
+
+	// Reduce 阶段
+	c.reduceStates = make(map[int64]time.Time)
+
+	// 全局
 	c.nReduce = int64(nReduce)
 
 	c.server()
