@@ -108,6 +108,7 @@ func (c *Coordinator) Distribute(args *Args, reply *Reply) error {
 			}
 
 			c.statesLock.Lock()
+			delete(c.reduceStates, args.ReduceCount)
 			c.reduceStates[reduceCount] = time.Now()
 			c.statesLock.Unlock()
 
