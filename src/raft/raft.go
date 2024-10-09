@@ -28,7 +28,6 @@ import (
 	"6.5840/labrpc"
 )
 
-
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -61,7 +60,40 @@ type Raft struct {
 	// Your data here (3A, 3B, 3C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	// persistent state
+	currentTerm int
+	votedFor    int
+	log         []LogEntry
 
+	// volatile state
+	commitIndex int
+	lastApplied int
+
+	// leader volatile state
+	nextIndex  []int
+	matchIndex []int
+
+	// other
+	serverCount       int
+	currentState      ServerState
+	receive           atomic.Bool
+	requestVoteChan   chan *requestVoteRequest
+	voteTimerChan     chan int
+	AppendEntriesChan chan *AppendEntriesRequest
+	taskChannels      []chan int
+}
+
+type ServerState int
+
+const (
+	Follower ServerState = iota
+	Candidate
+	Leader
+)
+
+type LogEntry struct {
+	Command interface{}
+	Term    int
 }
 
 // return currentTerm and whether this server
@@ -71,6 +103,11 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (3A).
+	rf.mu.Lock()
+	term = rf.currentTerm
+	isleader = rf.currentState == Leader
+	rf.mu.Unlock()
+
 	return term, isleader
 }
 
@@ -92,7 +129,6 @@ func (rf *Raft) persist() {
 	// rf.persister.Save(raftstate, nil)
 }
 
-
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
@@ -113,7 +149,6 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -123,22 +158,36 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+type requestVoteRequest struct {
+	args       *RequestVoteArgs
+	notifyChan chan int
+	reply      *RequestVoteReply
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
+	Term        int
+	VoteGranted bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	notifyChan := make(chan int)
+	rf.requestVoteChan <- &requestVoteRequest{args, notifyChan, reply}
+	<-notifyChan
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -173,6 +222,37 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+type AppendEntriesArgs struct {
+	// Your data here (3A, 3B).
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesRequest struct {
+	args       *AppendEntriesArgs
+	notifyChan chan int
+	reply      *AppendEntriesReply
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	notifyChan := make(chan int)
+	rf.AppendEntriesChan <- &AppendEntriesRequest{args, notifyChan, reply}
+	<-notifyChan
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -193,7 +273,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (3B).
 
-
 	return index, term, isLeader
 }
 
@@ -209,6 +288,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	time.Sleep(450 * time.Millisecond)
 }
 
 func (rf *Raft) killed() bool {
@@ -222,10 +302,15 @@ func (rf *Raft) ticker() {
 		// Your code here (3A)
 		// Check if a leader election should be started.
 
+		rf.mu.Lock()
+		if rf.currentState != Leader && !rf.receive.Swap(false) {
+			rf.voteTimerChan <- 0
+		}
+		rf.mu.Unlock()
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
+		ms := 300 + (rand.Int63() % 150)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -247,6 +332,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
+	rf.votedFor = -1
+	rf.log = []LogEntry{{}}
+
+	rf.serverCount = len(peers)
+	rf.currentState = Follower
+	rf.receive.Store(true)
+	rf.requestVoteChan = make(chan *requestVoteRequest)
+	rf.voteTimerChan = make(chan int)
+	rf.AppendEntriesChan = make(chan *AppendEntriesRequest)
+
+	go rf.mainLoop()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -254,6 +350,311 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
-
 	return rf
+}
+
+func (rf *Raft) mainLoop() {
+	for rf.killed() == false {
+
+		select {
+
+		// Respond to RPCs from candidates and leaders
+		case requestVoteRequest := <-rf.requestVoteChan:
+			rf.requestVoteRequestHandler(requestVoteRequest)
+
+		// Respond to RPCs from candidates and leaders
+		case appendEntriesRequest := <-rf.AppendEntriesChan:
+			rf.appendEntriesRequestHandler(appendEntriesRequest)
+
+		// If election timeout elapses without receiving AppendEntries
+		// RPC from current leader or granting vote to candidate:
+		// convert to candidate
+		case <-rf.voteTimerChan:
+			// On conversion to candidate, start election:
+			//	• Increment currentTerm
+			//	• Vote for self
+			//	• Reset election timer
+			rf.mu.Lock()
+			if rf.currentState == Candidate || rf.currentState == Follower {
+				rf.currentState = Candidate
+				rf.currentTerm++
+				rf.votedFor = rf.me
+				savedTerm := rf.currentTerm
+				rf.receive.Store(true)
+
+				go rf.sendRequestVoteToAll(savedTerm)
+			}
+			rf.mu.Unlock()
+		}
+
+	}
+}
+
+func (rf *Raft) appendEntriesRequestHandler(appendEntriesRequest *AppendEntriesRequest) {
+	appendEntriesArgs := appendEntriesRequest.args
+	notifyChan := appendEntriesRequest.notifyChan
+	appendEntriesReply := appendEntriesRequest.reply
+
+	if appendEntriesArgs.Term < rf.currentTerm {
+		// Reply false if term < currentTerm (§5.1)
+		appendEntriesReply.Success = false
+	} else {
+		// 一个 term 只有一个 Leader
+		rf.receive.Store(true)
+		// 创建新 channel 代替清除
+		rf.voteTimerChan = make(chan int)
+		// If RPC request or response contains term T > currentTerm:
+		// set currentTerm = T, convert to follower (§5.1)
+		rf.mu.Lock()
+		if appendEntriesArgs.Term > rf.currentTerm {
+			rf.currentTerm = appendEntriesArgs.Term
+			// 该 term 有 Leader 了
+			// rf.votedFor = -1
+			rf.currentState = Follower
+		}
+
+		// If AppendEntries RPC received from new leader: convert to
+		// follower
+		if rf.currentState == Candidate {
+			rf.currentState = Follower
+		}
+
+		if appendEntriesArgs.PrevLogIndex >= len(rf.log) || rf.log[appendEntriesArgs.PrevLogIndex].Term != appendEntriesArgs.PrevLogTerm {
+			// Reply false if log doesn’t contain an entry at prevLogIndex
+			// whose term matches prevLogTerm (§5.3)
+			appendEntriesReply.Success = false
+		} else {
+			// If an existing entry conflicts with a new one (same index
+			// but different terms), delete the existing entry and all that
+			// follow it (§5.3)
+			// Append any new entries not already in the log
+			if len(appendEntriesArgs.Entries) != 0 {
+
+				rf.log = append(rf.log[:appendEntriesArgs.PrevLogIndex+1], appendEntriesArgs.Entries...)
+
+				// todo: persistence
+			}
+			// If leaderCommit > commitIndex, set commitIndex =
+			// min(leaderCommit, index of last new entry)
+			if appendEntriesArgs.LeaderCommit > rf.commitIndex {
+				rf.commitIndex = min(appendEntriesArgs.LeaderCommit, len(rf.log)-1)
+				// todo: commit
+			}
+
+		}
+		rf.mu.Unlock()
+	}
+
+	appendEntriesReply.Term = rf.currentTerm
+
+	notifyChan <- 1
+}
+
+func (rf *Raft) requestVoteRequestHandler(requestVoteRequest *requestVoteRequest) {
+	requestVoteArgs := requestVoteRequest.args
+	notifyChan := requestVoteRequest.notifyChan
+	requestVoteReply := requestVoteRequest.reply
+
+	DPrintf("%v: get requestVote from %v\n", rf.me, requestVoteArgs.CandidateId)
+
+	if requestVoteArgs.Term < rf.currentTerm {
+		// Reply false if term < currentTerm (§5.1)
+		requestVoteReply.VoteGranted = false
+	} else {
+		// 收到可能的候选人消息
+		rf.receive.Store(true)
+		// If RPC request or response contains term T > currentTerm:
+		// set currentTerm = T, convert to follower (§5.1)
+		rf.mu.Lock()
+		if requestVoteArgs.Term > rf.currentTerm {
+			rf.currentTerm = requestVoteArgs.Term
+			rf.votedFor = -1
+			rf.currentState = Follower
+		}
+
+		lastLogIndex := len(rf.log)
+		lastLogEntry := rf.log[lastLogIndex-1]
+		// If votedFor is null or candidateId, and candidate’s log is at
+		// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
+		if (rf.votedFor == -1 || rf.votedFor == requestVoteArgs.CandidateId) && (requestVoteArgs.LastLogTerm > lastLogEntry.Term || requestVoteArgs.LastLogTerm == lastLogEntry.Term && requestVoteArgs.LastLogIndex >= lastLogIndex-1) {
+			requestVoteReply.VoteGranted = true
+			rf.votedFor = requestVoteArgs.CandidateId
+			DPrintf("%v: agree requestVote term: %v id: %v\n", rf.me, requestVoteArgs.Term, requestVoteArgs.CandidateId)
+
+		} else {
+			requestVoteReply.VoteGranted = false
+		}
+		rf.mu.Unlock()
+	}
+
+	requestVoteReply.Term = rf.currentTerm
+
+	notifyChan <- 1
+}
+
+// 发送 AppendEntries
+func (rf *Raft) leaderRoutine(taskChan chan int, server int, forTerm int) {
+	DPrintf("%v: leaderRoutine for %v \n", rf.me, server)
+	ch := make(chan *AppendEntriesReply)
+	for rf.currentState == Leader && !rf.killed() && forTerm == rf.currentTerm {
+
+		// Upon election: send initial empty AppendEntries RPCs
+		// (heartbeat) to each server;
+
+		prevLogIndex := rf.nextIndex[server] - 1
+		// 复制了 Log，加锁
+		rf.mu.Lock()
+		args := AppendEntriesArgs{rf.currentTerm, rf.me, prevLogIndex, rf.log[prevLogIndex].Term, rf.log[prevLogIndex+1:], rf.commitIndex}
+		rf.mu.Unlock()
+
+		go rf.sendAppendEntriesToServer(ch, server, &args)
+
+		<-taskChan
+	}
+	ch <- &AppendEntriesReply{}
+}
+
+func (rf *Raft) AppendEntriesReplyHandler(forTerm int, ch chan *AppendEntriesReply, server int) {
+	reply := <-ch
+	rf.mu.Lock()
+	for rf.currentState == Leader && !rf.killed() && forTerm == rf.currentTerm {
+
+		DPrintf("%v: Heartbeat to %v %v\n", rf.me, server, reply.Term != -1)
+		// If RPC request or response contains term T > currentTerm:
+		// set currentTerm = T, convert to follower (§5.1)
+
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.currentState = Follower
+		}
+
+		reply = <-ch
+	}
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) sendRequestVoteToAll(forTerm int) {
+
+	voteCount := 1
+
+	ch := make(chan *RequestVoteReply)
+
+	rf.mu.Lock()
+	logLen := len(rf.log)
+	args := &RequestVoteArgs{forTerm, rf.me, logLen - 1, rf.log[logLen-1].Term}
+	rf.mu.Unlock()
+	for i := 0; i < rf.serverCount; i++ {
+		if i == rf.me {
+			continue
+		}
+		go rf.sendRequestVoteToServer(ch, i, args)
+	}
+
+	for i := 0; i < rf.serverCount-1; i++ {
+		reply := <-ch
+		// If RPC request or response contains term T > currentTerm:
+		// set currentTerm = T, convert to follower (§5.1)
+		rf.mu.Lock()
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.currentState = Follower
+		}
+		rf.mu.Unlock()
+
+		if rf.currentTerm > forTerm {
+			break
+		}
+
+		if reply.VoteGranted {
+			voteCount++
+			// If votes received from majority of servers: become leader
+			if voteCount > rf.serverCount/2 {
+				rf.mu.Lock()
+				if forTerm == rf.currentTerm {
+					DPrintf("%v: become leader term: %v\n", rf.me, rf.currentTerm)
+					rf.currentState = Leader
+					rf.initLeaderState()
+				}
+				rf.mu.Unlock()
+				break
+			}
+		}
+	}
+}
+
+// 调用时已经加锁
+func (rf *Raft) initLeaderState() {
+	rf.nextIndex = make([]int, rf.serverCount)
+	rf.matchIndex = make([]int, rf.serverCount)
+	rf.taskChannels = make([]chan int, rf.serverCount)
+	for i := 0; i < rf.serverCount; i++ {
+		if i == rf.me {
+			continue
+		}
+		// for each server, index of the next log entry
+		// to send to that server (initialized to leader
+		// last log index + 1)
+		rf.nextIndex[i] = len(rf.log)
+		// for each server, index of highest log entry
+		// known to be replicated on server
+		// (initialized to 0, increases monotonically)
+		rf.matchIndex[i] = 0
+		rf.taskChannels[i] = make(chan int)
+		go rf.leaderRoutine(rf.taskChannels[i], i, rf.currentTerm)
+	}
+	go rf.heartbeatTicker(rf.taskChannels, rf.currentTerm)
+}
+
+func (rf *Raft) heartbeatTicker(taskChannels []chan int, forTerm int) {
+	time.Sleep(100 * time.Millisecond)
+	for rf.currentState == Leader && rf.killed() == false && rf.currentTerm == forTerm {
+
+		// repeat during idle periods to
+		// prevent election timeouts (§5.2)
+		for i := 0; i < rf.serverCount; i++ {
+			if i == rf.me {
+				continue
+			}
+			taskChannels[i] <- i
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// 让前面创建的 routine 退出
+	for i := 0; i < rf.serverCount; i++ {
+		if i == rf.me {
+			continue
+		}
+		taskChannels[i] <- i
+	}
+
+}
+
+func (rf *Raft) sendRequestVoteToServer(ch chan *RequestVoteReply, server int, args *RequestVoteArgs) {
+	reply := RequestVoteReply{}
+	ok := rf.sendRequestVote(server, args, &reply)
+	DPrintf("%v: requestVote to %v %v\n", rf.me, server, ok)
+	if ok {
+		ch <- &reply
+	} else {
+		ch <- &RequestVoteReply{-1, false}
+	}
+}
+
+func (rf *Raft) sendAppendEntriesToServer(ch chan *AppendEntriesReply, server int, args *AppendEntriesArgs) {
+	reply := AppendEntriesReply{}
+	ok := rf.sendAppendEntries(server, args, &reply)
+	DPrintf("%v: requestVote to %v %v\n", rf.me, server, ok)
+	if ok {
+		ch <- &reply
+	} else {
+		ch <- &AppendEntriesReply{-1, false}
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
