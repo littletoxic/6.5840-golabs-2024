@@ -96,6 +96,12 @@ type LogEntry struct {
 	Term    int
 }
 
+type AERChannelWithMutex struct {
+	ch     chan *AppendEntriesReply
+	closed bool
+	mu     sync.Mutex
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -288,7 +294,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	time.Sleep(450 * time.Millisecond)
 }
 
 func (rf *Raft) killed() bool {
@@ -313,6 +318,7 @@ func (rf *Raft) ticker() {
 		ms := 300 + (rand.Int63() % 150)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
+	rf.voteTimerChan <- 0
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -375,7 +381,7 @@ func (rf *Raft) mainLoop() {
 			//	• Vote for self
 			//	• Reset election timer
 			rf.mu.Lock()
-			if rf.currentState == Candidate || rf.currentState == Follower {
+			if !rf.killed() && rf.currentState == Candidate || rf.currentState == Follower {
 				rf.currentState = Candidate
 				rf.currentTerm++
 				rf.votedFor = rf.me
@@ -387,6 +393,27 @@ func (rf *Raft) mainLoop() {
 			rf.mu.Unlock()
 		}
 
+	}
+
+	// clean up
+	// 可能不完全，确保完全清理可以给 channel 加锁
+	for {
+		finish := false
+		select {
+
+		case requestVoteRequest := <-rf.requestVoteChan:
+			requestVoteRequest.notifyChan <- 1
+
+		case appendEntriesRequest := <-rf.AppendEntriesChan:
+			appendEntriesRequest.notifyChan <- 1
+
+		default:
+			finish = true
+		}
+
+		if finish {
+			break
+		}
 	}
 }
 
@@ -401,8 +428,6 @@ func (rf *Raft) appendEntriesRequestHandler(appendEntriesRequest *AppendEntriesR
 	} else {
 		// 一个 term 只有一个 Leader
 		rf.receive.Store(true)
-		// 创建新 channel 代替清除
-		rf.voteTimerChan = make(chan int)
 		// If RPC request or response contains term T > currentTerm:
 		// set currentTerm = T, convert to follower (§5.1)
 		rf.mu.Lock()
@@ -495,7 +520,11 @@ func (rf *Raft) requestVoteRequestHandler(requestVoteRequest *requestVoteRequest
 // 发送 AppendEntries
 func (rf *Raft) leaderRoutine(taskChan chan int, server int, forTerm int) {
 	DPrintf("%v: leaderRoutine for %v \n", rf.me, server)
-	ch := make(chan *AppendEntriesReply)
+	// 多处发送，用锁保护
+	ch := &AERChannelWithMutex{ch: make(chan *AppendEntriesReply), closed: false}
+	// 只接收不需要锁
+	go rf.AppendEntriesReplyHandler(forTerm, ch.ch, server)
+
 	for rf.currentState == Leader && !rf.killed() && forTerm == rf.currentTerm {
 
 		// Upon election: send initial empty AppendEntries RPCs
@@ -506,31 +535,42 @@ func (rf *Raft) leaderRoutine(taskChan chan int, server int, forTerm int) {
 		rf.mu.Lock()
 		args := AppendEntriesArgs{rf.currentTerm, rf.me, prevLogIndex, rf.log[prevLogIndex].Term, rf.log[prevLogIndex+1:], rf.commitIndex}
 		rf.mu.Unlock()
-
-		go rf.sendAppendEntriesToServer(ch, server, &args)
+		// 需要检测 channel 是否关闭
+		go rf.sendAppendEntriesToServer(ch, server, &args, forTerm)
 
 		<-taskChan
 	}
-	ch <- &AppendEntriesReply{}
+	ch.ch <- &AppendEntriesReply{}
+
+	ch.mu.Lock()
+	close(ch.ch)
+	ch.closed = true
+	ch.mu.Unlock()
+
+	for _ = range taskChan {
+	}
 }
 
 func (rf *Raft) AppendEntriesReplyHandler(forTerm int, ch chan *AppendEntriesReply, server int) {
 	reply := <-ch
-	rf.mu.Lock()
+
 	for rf.currentState == Leader && !rf.killed() && forTerm == rf.currentTerm {
 
 		DPrintf("%v: Heartbeat to %v %v\n", rf.me, server, reply.Term != -1)
 		// If RPC request or response contains term T > currentTerm:
 		// set currentTerm = T, convert to follower (§5.1)
-
+		rf.mu.Lock()
 		if reply.Term > rf.currentTerm {
 			rf.currentTerm = reply.Term
 			rf.currentState = Follower
 		}
 
+		rf.mu.Unlock()
+
 		reply = <-ch
 	}
-	rf.mu.Unlock()
+	for _ = range ch {
+	}
 }
 
 func (rf *Raft) sendRequestVoteToAll(forTerm int) {
@@ -550,7 +590,8 @@ func (rf *Raft) sendRequestVoteToAll(forTerm int) {
 		go rf.sendRequestVoteToServer(ch, i, args)
 	}
 
-	for i := 0; i < rf.serverCount-1; i++ {
+	i := 0
+	for ; i < rf.serverCount-1; i++ {
 		reply := <-ch
 		// If RPC request or response contains term T > currentTerm:
 		// set currentTerm = T, convert to follower (§5.1)
@@ -562,6 +603,7 @@ func (rf *Raft) sendRequestVoteToAll(forTerm int) {
 		rf.mu.Unlock()
 
 		if rf.currentTerm > forTerm {
+			i++
 			break
 		}
 
@@ -576,10 +618,15 @@ func (rf *Raft) sendRequestVoteToAll(forTerm int) {
 					rf.initLeaderState()
 				}
 				rf.mu.Unlock()
+				i++
 				break
 			}
 		}
 	}
+	for ; i < rf.serverCount-1; i++ {
+		<-ch
+	}
+	DPrintf("%v: exit: sendRequestVoteToAll\n", rf.me)
 }
 
 // 调用时已经加锁
@@ -626,6 +673,7 @@ func (rf *Raft) heartbeatTicker(taskChannels []chan int, forTerm int) {
 			continue
 		}
 		taskChannels[i] <- i
+		close(taskChannels[i])
 	}
 
 }
@@ -633,7 +681,7 @@ func (rf *Raft) heartbeatTicker(taskChannels []chan int, forTerm int) {
 func (rf *Raft) sendRequestVoteToServer(ch chan *RequestVoteReply, server int, args *RequestVoteArgs) {
 	reply := RequestVoteReply{}
 	ok := rf.sendRequestVote(server, args, &reply)
-	DPrintf("%v: requestVote to %v %v\n", rf.me, server, ok)
+	DPrintf("%v: RequestVote to %v %v %v\n", rf.me, server, ok, reply.VoteGranted)
 	if ok {
 		ch <- &reply
 	} else {
@@ -641,15 +689,21 @@ func (rf *Raft) sendRequestVoteToServer(ch chan *RequestVoteReply, server int, a
 	}
 }
 
-func (rf *Raft) sendAppendEntriesToServer(ch chan *AppendEntriesReply, server int, args *AppendEntriesArgs) {
+func (rf *Raft) sendAppendEntriesToServer(ch *AERChannelWithMutex, server int, args *AppendEntriesArgs, forTerm int) {
 	reply := AppendEntriesReply{}
 	ok := rf.sendAppendEntries(server, args, &reply)
-	DPrintf("%v: requestVote to %v %v\n", rf.me, server, ok)
-	if ok {
-		ch <- &reply
-	} else {
-		ch <- &AppendEntriesReply{-1, false}
+	DPrintf("%v: AppendEntries to %v %v\n", rf.me, server, ok)
+	if !ok {
+		reply.Term = -1
+		reply.Success = false
 	}
+
+	ch.mu.Lock()
+	if !ch.closed {
+		ch.ch <- &reply
+	}
+	ch.mu.Unlock()
+
 }
 
 func min(a, b int) int {
