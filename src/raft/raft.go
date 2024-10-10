@@ -250,11 +250,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.currentState = Follower
 		}
 
-		lastLogIndex := len(rf.log)
-		lastLogEntry := rf.log[lastLogIndex-1]
+		lastLogIndex := len(rf.log) - 1
+		lastLogEntry := rf.log[lastLogIndex]
 		// If votedFor is null or candidateId, and candidate’s log is at
 		// least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
-		if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && (args.LastLogTerm > lastLogEntry.Term || args.LastLogTerm == lastLogEntry.Term && args.LastLogIndex >= lastLogIndex-1) {
+		if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && (args.LastLogTerm > lastLogEntry.Term || (args.LastLogTerm == lastLogEntry.Term && args.LastLogIndex >= lastLogIndex)) {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
 			DPrintf("%v %v: agree requestVote from %v\n", rf.me, rf.currentTerm, args.CandidateId)
@@ -626,22 +626,20 @@ func (rf *Raft) sendRequestVoteToAll(forTerm int) {
 			rf.currentTerm = reply.Term
 			rf.currentState = Follower
 		}
-		rf.mu.Unlock()
 
 		if reply.VoteGranted {
 			voteCount++
 			// If votes received from majority of servers: become leader
 			if voteCount == (rf.serverCount/2)+1 {
-				rf.mu.Lock()
 				if forTerm == rf.currentTerm {
 					DPrintf("%v %v: become leader\n", rf.me, rf.currentTerm)
 					rf.currentState = Leader
 					rf.initLeaderState()
 				}
-				rf.mu.Unlock()
 
 			}
 		}
+		rf.mu.Unlock()
 	}
 
 }
