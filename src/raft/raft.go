@@ -193,12 +193,6 @@ type RequestVoteArgs struct {
 	LastLogTerm  int
 }
 
-type requestVoteRequest struct {
-	args       *RequestVoteArgs
-	notifyChan chan int
-	reply      *RequestVoteReply
-}
-
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
@@ -222,6 +216,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// If RPC request or response contains term T > currentTerm:
 		// set currentTerm = T, convert to follower (§5.1)
 		if args.Term > rf.currentTerm {
+			if rf.currentState == Leader {
+				rf.cleanup()
+			}
 			rf.currentTerm = args.Term
 			rf.votedFor = -1
 			rf.currentState = Follower
@@ -287,12 +284,6 @@ type AppendEntriesArgs struct {
 	LeaderCommit int
 }
 
-type AppendEntriesRequest struct {
-	args       *AppendEntriesArgs
-	notifyChan chan int
-	reply      *AppendEntriesReply
-}
-
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
@@ -310,6 +301,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// If RPC request or response contains term T > currentTerm:
 		// set currentTerm = T, convert to follower (§5.1)
 		if args.Term > rf.currentTerm {
+			if rf.currentState == Leader {
+				rf.cleanup()
+			}
 			rf.currentTerm = args.Term
 			// 该 term 有 Leader 了，不需要下面一行
 			// rf.votedFor = -1
@@ -322,28 +316,30 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.currentState = Follower
 		}
 
-		if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// not heartbeat
+		if len(args.Entries) != 0 {
 			// Reply false if log doesn’t contain an entry at prevLogIndex
 			// whose term matches prevLogTerm (§5.3)
-			reply.Success = false
-		} else {
-			// If an existing entry conflicts with a new one (same index
-			// but different terms), delete the existing entry and all that
-			// follow it (§5.3)
-			// Append any new entries not already in the log
-			if len(args.Entries) != 0 {
+			if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+				reply.Success = false
+			} else {
+				// If an existing entry conflicts with a new one (same index
+				// but different terms), delete the existing entry and all that
+				// follow it (§5.3)
+				// Append any new entries not already in the log
 
 				rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 
 				// todo: persistence
-			}
-			// If leaderCommit > commitIndex, set commitIndex =
-			// min(leaderCommit, index of last new entry)
-			if args.LeaderCommit > rf.commitIndex {
-				rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
-				// todo: commit
-			}
 
+			}
+		}
+
+		// If leaderCommit > commitIndex, set commitIndex =
+		// min(leaderCommit, index of last new entry)
+		if args.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+			// todo: commit
 		}
 
 	}
@@ -412,15 +408,21 @@ func (rf *Raft) ticker() {
 		// Check if a leader election should be started.
 
 		rf.mu.Lock()
+
 		if !rf.killed() && rf.currentState != Leader && !rf.receive {
+			// On conversion to candidate, start election:
+			//	• Increment currentTerm
+			//	• Vote for self
+			//	• Reset election timer
+			//	• Send RequestVote RPCs to all other servers
 			rf.currentState = Candidate
 			rf.currentTerm++
 			rf.votedFor = rf.me
 			savedTerm := rf.currentTerm
-			rf.receive = true
 
 			go rf.sendRequestVoteToAll(savedTerm)
 		}
+		rf.receive = false
 		rf.mu.Unlock()
 
 		// pause for a random amount of time between 50 and 350
@@ -453,7 +455,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.serverCount = len(peers)
 	rf.currentState = Follower
 	rf.receive = true
-
+	rf.sendTasks = make([]*Shared, rf.serverCount)
 	for i := 0; i < rf.serverCount; i++ {
 		if i == rf.me {
 			continue
@@ -473,13 +475,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 func (rf *Raft) sendAppendEntriesRoutine(cond *Shared, server int, forTerm int) {
 	DPrintf("%v %v: sendAppendEntriesRoutine for %v \n", rf.me, forTerm, server)
 
+	cond.Wait()
 	for rf.currentState == Leader && !rf.killed() && forTerm == rf.currentTerm {
 
-		// Upon election: send initial empty AppendEntries RPCs
-		// (heartbeat) to each server;
-		prevLogIndex := rf.nextIndex[server] - 1
 		// 复制了 Log，加锁
 		rf.mu.Lock()
+		prevLogIndex := rf.nextIndex[server] - 1
 		args := AppendEntriesArgs{rf.currentTerm, rf.me, prevLogIndex, rf.log[prevLogIndex].Term, rf.log[prevLogIndex+1:], rf.commitIndex}
 		rf.mu.Unlock()
 
@@ -492,6 +493,9 @@ func (rf *Raft) sendAppendEntriesRoutine(cond *Shared, server int, forTerm int) 
 			// set currentTerm = T, convert to follower (§5.1)
 			rf.mu.Lock()
 			if reply.Term > rf.currentTerm {
+				if rf.currentState == Leader {
+					rf.cleanup()
+				}
 				rf.currentTerm = reply.Term
 				rf.currentState = Follower
 			}
@@ -529,6 +533,9 @@ func (rf *Raft) sendRequestVoteToAll(forTerm int) {
 		// set currentTerm = T, convert to follower (§5.1)
 		rf.mu.Lock()
 		if reply.Term > rf.currentTerm {
+			if rf.currentState == Leader {
+				rf.cleanup()
+			}
 			rf.currentTerm = reply.Term
 			rf.currentState = Follower
 		}
@@ -572,19 +579,47 @@ func (rf *Raft) initLeaderState() {
 		rf.sendTasks[i] = NewShared()
 		go rf.sendAppendEntriesRoutine(rf.sendTasks[i], i, rf.currentTerm)
 		// 一直发送空 appendEntries
-		go rf.heartbeatTicker(rf.sendTasks[i], rf.currentTerm)
+		go rf.heartbeatTicker(rf.currentTerm, i)
 	}
 }
 
-func (rf *Raft) heartbeatTicker(cond *Shared, forTerm int) {
+// repeat during idle periods to
+// prevent election timeouts (§5.2)
+func (rf *Raft) heartbeatTicker(forTerm int, server int) {
 	for rf.currentState == Leader && rf.killed() == false && rf.currentTerm == forTerm {
-
-		// repeat during idle periods to
-		// prevent election timeouts (§5.2)
-
+		// Upon election: send initial empty AppendEntries RPCs
+		// (heartbeat) to each server;
+		go rf.sendHeartbeat(server)
 		time.Sleep(100 * time.Millisecond)
 	}
 
+}
+
+func (rf *Raft) sendHeartbeat(server int) {
+	// 复制了 Log，加锁
+	rf.mu.Lock()
+	// 心跳时不关心别的字段
+	args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, LeaderCommit: rf.commitIndex}
+	rf.mu.Unlock()
+
+	reply := AppendEntriesReply{}
+	ok := rf.sendAppendEntries(server, &args, &reply)
+	DPrintf("%v %v: send AppendEntries to %v %v\n", rf.me, args.Term, server, ok)
+
+	if ok {
+		// If RPC request or response contains term T > currentTerm:
+		// set currentTerm = T, convert to follower (§5.1)
+		rf.mu.Lock()
+		if reply.Term > rf.currentTerm {
+			if rf.currentState == Leader {
+				rf.cleanup()
+			}
+			rf.currentTerm = reply.Term
+			rf.currentState = Follower
+		}
+
+		rf.mu.Unlock()
+	}
 }
 
 func (rf *Raft) sendRequestVoteToServer(ch chan *RequestVoteReply, server int, args *RequestVoteArgs) {
@@ -599,8 +634,14 @@ func (rf *Raft) sendRequestVoteToServer(ch chan *RequestVoteReply, server int, a
 
 }
 
-// 从 Leader 状态转换时调用，认为
+// 从 Leader 状态转换时调用，认为已经持有锁
 func (rf *Raft) cleanup() {
+	for i := 0; i < rf.serverCount; i++ {
+		if i == rf.me {
+			continue
+		}
+		rf.sendTasks[i].Notify()
+	}
 
 }
 
