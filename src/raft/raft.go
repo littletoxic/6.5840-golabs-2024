@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,10 +75,12 @@ type Raft struct {
 	matchIndex []int
 
 	// other
-	serverCount  int
-	currentState ServerState
-	receive      bool
-	sendTasks    []*Shared
+	serverCount   int
+	currentState  ServerState
+	receive       bool
+	sendNotifiers []*DelayNotifier
+	commitChanged *Broadcaster
+	applyCh       chan ApplyMsg
 }
 
 type ServerState int
@@ -93,19 +96,19 @@ type LogEntry struct {
 	Term    int
 }
 
-type Shared struct {
+type DelayNotifier struct {
 	mu    sync.Mutex
 	cond  *sync.Cond
 	ready bool
 }
 
-func NewShared() *Shared {
-	s := &Shared{}
+func NewDelayNotifier() *DelayNotifier {
+	s := &DelayNotifier{}
 	s.cond = sync.NewCond(&s.mu)
 	return s
 }
 
-func (s *Shared) Wait() {
+func (s *DelayNotifier) Wait() {
 	s.mu.Lock()
 	for !s.ready {
 		s.cond.Wait() // 等待条件满足
@@ -114,10 +117,33 @@ func (s *Shared) Wait() {
 	s.mu.Unlock()
 }
 
-func (s *Shared) Notify() {
+func (s *DelayNotifier) Notify() {
 	s.mu.Lock()
 	s.ready = true
 	s.cond.Signal() // 通知一个等待的 goroutine
+	s.mu.Unlock()
+}
+
+type Broadcaster struct {
+	mu   sync.Mutex
+	cond *sync.Cond
+}
+
+func NewBroadcaster() *Broadcaster {
+	s := &Broadcaster{}
+	s.cond = sync.NewCond(&s.mu)
+	return s
+}
+
+func (s *Broadcaster) Wait() {
+	s.mu.Lock()
+	s.cond.Wait()
+	s.mu.Unlock()
+}
+
+func (s *Broadcaster) Broadcast() {
+	s.mu.Lock()
+	s.cond.Broadcast()
 	s.mu.Unlock()
 }
 
@@ -332,6 +358,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 				// todo: persistence
 
+				reply.Success = true
 			}
 		}
 
@@ -339,7 +366,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// min(leaderCommit, index of last new entry)
 		if args.LeaderCommit > rf.commitIndex {
 			rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
-			// todo: commit
+
+			rf.commitChanged.Broadcast()
 		}
 
 	}
@@ -373,11 +401,25 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	term = rf.currentTerm
 	isLeader = rf.currentState == Leader
-	rf.mu.Unlock()
 
 	if isLeader {
+		// If command received from client: append entry to local log,
+		// respond after entry applied to state machine (§5.3)
+		rf.log = append(rf.log, LogEntry{command, term})
+		index = len(rf.log) - 1
+		for i := 0; i < rf.serverCount; i++ {
+			if i == rf.me {
+				continue
+			}
+			rf.sendNotifiers[i].Notify()
+		}
+		rf.nextIndex[rf.me]++
+		rf.matchIndex[rf.me]++
+
+		DPrintf("%v %v: command appear in %v\n", rf.me, rf.currentTerm, index)
 
 	}
+	rf.mu.Unlock()
 
 	return index, term, isLeader
 }
@@ -394,6 +436,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.cleanup()
+	rf.commitChanged.Broadcast()
 }
 
 func (rf *Raft) killed() bool {
@@ -419,7 +463,7 @@ func (rf *Raft) ticker() {
 			rf.currentTerm++
 			rf.votedFor = rf.me
 			savedTerm := rf.currentTerm
-
+			DPrintf("%v %v: timeout\n", rf.me, rf.currentTerm)
 			go rf.sendRequestVoteToAll(savedTerm)
 		}
 		rf.receive = false
@@ -455,13 +499,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.serverCount = len(peers)
 	rf.currentState = Follower
 	rf.receive = true
-	rf.sendTasks = make([]*Shared, rf.serverCount)
+	rf.sendNotifiers = make([]*DelayNotifier, rf.serverCount)
 	for i := 0; i < rf.serverCount; i++ {
 		if i == rf.me {
 			continue
 		}
-		rf.sendTasks[i] = NewShared()
+		rf.sendNotifiers[i] = NewDelayNotifier()
 	}
+	rf.commitChanged = NewBroadcaster()
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -469,38 +515,79 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
+	go rf.applyRoutine()
+
 	return rf
 }
 
-func (rf *Raft) sendAppendEntriesRoutine(cond *Shared, server int, forTerm int) {
+func (rf *Raft) sendAppendEntriesRoutine(cond *DelayNotifier, server int, forTerm int) {
 	DPrintf("%v %v: sendAppendEntriesRoutine for %v \n", rf.me, forTerm, server)
 
 	cond.Wait()
-	for rf.currentState == Leader && !rf.killed() && forTerm == rf.currentTerm {
+	for !rf.killed() && forTerm == rf.currentTerm {
 
-		// 复制了 Log，加锁
-		rf.mu.Lock()
-		prevLogIndex := rf.nextIndex[server] - 1
-		args := AppendEntriesArgs{rf.currentTerm, rf.me, prevLogIndex, rf.log[prevLogIndex].Term, rf.log[prevLogIndex+1:], rf.commitIndex}
-		rf.mu.Unlock()
+		for !rf.killed() && forTerm == rf.currentTerm {
 
-		reply := AppendEntriesReply{}
-		ok := rf.sendAppendEntries(server, &args, &reply)
-		DPrintf("%v %v: send AppendEntries to %v %v\n", rf.me, args.Term, server, ok)
-
-		if ok {
-			// If RPC request or response contains term T > currentTerm:
-			// set currentTerm = T, convert to follower (§5.1)
 			rf.mu.Lock()
-			if reply.Term > rf.currentTerm {
-				if rf.currentState == Leader {
-					rf.cleanup()
-				}
-				rf.currentTerm = reply.Term
-				rf.currentState = Follower
-			}
+			lastLog := len(rf.log) - 1
+			nextIndex := rf.nextIndex[server]
+			var args AppendEntriesArgs
+			reply := AppendEntriesReply{}
+
+			args = AppendEntriesArgs{forTerm, rf.me, nextIndex - 1, rf.log[nextIndex-1].Term, rf.log[nextIndex:], rf.commitIndex}
 
 			rf.mu.Unlock()
+
+			// If last log index ≥ nextIndex for a follower: send
+			// AppendEntries RPC with log entries starting at nextIndex
+			if lastLog >= nextIndex {
+				ok := rf.sendAppendEntries(server, &args, &reply)
+
+				if ok {
+
+					// If RPC request or response contains term T > currentTerm:
+					// set currentTerm = T, convert to follower (§5.1)
+					rf.mu.Lock()
+					if reply.Term > rf.currentTerm {
+						if rf.currentState == Leader {
+							rf.cleanup()
+						}
+						rf.currentTerm = reply.Term
+						rf.currentState = Follower
+						rf.mu.Unlock()
+						break
+					}
+					DPrintf("%v %v: send AppendEntries to %v %v\n", rf.me, args.Term, server, reply.Success)
+
+					// If successful: update nextIndex and matchIndex for
+					// follower (§5.3)
+					if reply.Success {
+						rf.nextIndex[server] = lastLog + 1
+						rf.matchIndex[server] = lastLog
+
+						// 是否有更高的 committed
+						// If there exists an N such that N > commitIndex, a majority
+						// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+						// set commitIndex = N (§5.3, §5.4).
+						m := median(rf.matchIndex)
+						if m > rf.commitIndex {
+							rf.commitIndex = m
+							DPrintf("%v %v: committChanged to %v \n", rf.me, args.Term, m)
+
+							rf.commitChanged.Broadcast()
+						}
+
+						rf.mu.Unlock()
+						break
+					} else {
+						// If AppendEntries fails because of log inconsistency:
+						// decrement nextIndex and retry (§5.3)
+						rf.nextIndex[server]--
+					}
+
+					rf.mu.Unlock()
+				}
+			}
 		}
 
 		cond.Wait()
@@ -563,11 +650,8 @@ func (rf *Raft) sendRequestVoteToAll(forTerm int) {
 func (rf *Raft) initLeaderState() {
 	rf.nextIndex = make([]int, rf.serverCount)
 	rf.matchIndex = make([]int, rf.serverCount)
-	rf.sendTasks = make([]*Shared, rf.serverCount)
+	rf.sendNotifiers = make([]*DelayNotifier, rf.serverCount)
 	for i := 0; i < rf.serverCount; i++ {
-		if i == rf.me {
-			continue
-		}
 		// for each server, index of the next log entry
 		// to send to that server (initialized to leader
 		// last log index + 1)
@@ -576,8 +660,12 @@ func (rf *Raft) initLeaderState() {
 		// known to be replicated on server
 		// (initialized to 0, increases monotonically)
 		rf.matchIndex[i] = 0
-		rf.sendTasks[i] = NewShared()
-		go rf.sendAppendEntriesRoutine(rf.sendTasks[i], i, rf.currentTerm)
+		if i == rf.me {
+			rf.matchIndex[i] = len(rf.log) - 1
+			continue
+		}
+		rf.sendNotifiers[i] = NewDelayNotifier()
+		go rf.sendAppendEntriesRoutine(rf.sendNotifiers[i], i, rf.currentTerm)
 		// 一直发送空 appendEntries
 		go rf.heartbeatTicker(rf.currentTerm, i)
 	}
@@ -586,7 +674,7 @@ func (rf *Raft) initLeaderState() {
 // repeat during idle periods to
 // prevent election timeouts (§5.2)
 func (rf *Raft) heartbeatTicker(forTerm int, server int) {
-	for rf.currentState == Leader && rf.killed() == false && rf.currentTerm == forTerm {
+	for rf.killed() == false && rf.currentTerm == forTerm {
 		// Upon election: send initial empty AppendEntries RPCs
 		// (heartbeat) to each server;
 		go rf.sendHeartbeat(server)
@@ -596,7 +684,6 @@ func (rf *Raft) heartbeatTicker(forTerm int, server int) {
 }
 
 func (rf *Raft) sendHeartbeat(server int) {
-	// 复制了 Log，加锁
 	rf.mu.Lock()
 	// 心跳时不关心别的字段
 	args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, LeaderCommit: rf.commitIndex}
@@ -604,7 +691,6 @@ func (rf *Raft) sendHeartbeat(server int) {
 
 	reply := AppendEntriesReply{}
 	ok := rf.sendAppendEntries(server, &args, &reply)
-	DPrintf("%v %v: send AppendEntries to %v %v\n", rf.me, args.Term, server, ok)
 
 	if ok {
 		// If RPC request or response contains term T > currentTerm:
@@ -625,10 +711,11 @@ func (rf *Raft) sendHeartbeat(server int) {
 func (rf *Raft) sendRequestVoteToServer(ch chan *RequestVoteReply, server int, args *RequestVoteArgs) {
 	reply := RequestVoteReply{}
 	ok := rf.sendRequestVote(server, args, &reply)
-	DPrintf("%v %v: RequestVote to %v %v %v\n", rf.me, args.Term, server, ok, reply.VoteGranted)
 	if !ok {
 		reply.Term = -1
 		reply.VoteGranted = false
+	} else {
+		DPrintf("%v %v: RequestVote to %v %v %v\n", rf.me, args.Term, server, ok, reply.VoteGranted)
 	}
 	ch <- &reply
 
@@ -640,9 +727,24 @@ func (rf *Raft) cleanup() {
 		if i == rf.me {
 			continue
 		}
-		rf.sendTasks[i].Notify()
+		rf.sendNotifiers[i].Notify()
 	}
 
+}
+
+func (rf *Raft) applyRoutine() {
+	rf.commitChanged.Wait()
+	for rf.killed() == false {
+		i := rf.lastApplied + 1
+		for ; i <= rf.commitIndex && !rf.killed(); i++ {
+
+			apply := ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i}
+			rf.applyCh <- apply
+		}
+		rf.lastApplied = i - 1
+
+		rf.commitChanged.Wait()
+	}
 }
 
 func min(a, b int) int {
@@ -650,4 +752,22 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func median(nums []int) int {
+	// 复制切片以保持原始切片不变
+	copied := make([]int, len(nums))
+	copy(copied, nums)
+
+	// 排序复制的切片
+	sort.Ints(copied)
+
+	n := len(copied)
+	if n%2 == 1 {
+		// 如果切片长度是奇数，中位数是中间的元素
+		return copied[n/2]
+	} else {
+		// 如果切片长度是偶数
+		return copied[n/2-1]
+	}
 }
