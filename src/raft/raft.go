@@ -407,6 +407,8 @@ func (rf *Raft) mainLoop() {
 		case appendEntriesRequest := <-rf.AppendEntriesChan:
 			appendEntriesRequest.notifyChan <- 1
 
+		case <-rf.voteTimerChan:
+
 		default:
 			finish = true
 		}
@@ -422,6 +424,7 @@ func (rf *Raft) appendEntriesRequestHandler(appendEntriesRequest *AppendEntriesR
 	notifyChan := appendEntriesRequest.notifyChan
 	appendEntriesReply := appendEntriesRequest.reply
 
+	rf.mu.Lock()
 	if appendEntriesArgs.Term < rf.currentTerm {
 		// Reply false if term < currentTerm (§5.1)
 		appendEntriesReply.Success = false
@@ -430,7 +433,7 @@ func (rf *Raft) appendEntriesRequestHandler(appendEntriesRequest *AppendEntriesR
 		rf.receive.Store(true)
 		// If RPC request or response contains term T > currentTerm:
 		// set currentTerm = T, convert to follower (§5.1)
-		rf.mu.Lock()
+
 		if appendEntriesArgs.Term > rf.currentTerm {
 			rf.currentTerm = appendEntriesArgs.Term
 			// 该 term 有 Leader 了
@@ -467,10 +470,10 @@ func (rf *Raft) appendEntriesRequestHandler(appendEntriesRequest *AppendEntriesR
 			}
 
 		}
-		rf.mu.Unlock()
-	}
 
+	}
 	appendEntriesReply.Term = rf.currentTerm
+	rf.mu.Unlock()
 
 	notifyChan <- 1
 }
@@ -482,6 +485,7 @@ func (rf *Raft) requestVoteRequestHandler(requestVoteRequest *requestVoteRequest
 
 	DPrintf("%v: get requestVote from %v\n", rf.me, requestVoteArgs.CandidateId)
 
+	rf.mu.Lock()
 	if requestVoteArgs.Term < rf.currentTerm {
 		// Reply false if term < currentTerm (§5.1)
 		requestVoteReply.VoteGranted = false
@@ -490,7 +494,7 @@ func (rf *Raft) requestVoteRequestHandler(requestVoteRequest *requestVoteRequest
 		rf.receive.Store(true)
 		// If RPC request or response contains term T > currentTerm:
 		// set currentTerm = T, convert to follower (§5.1)
-		rf.mu.Lock()
+
 		if requestVoteArgs.Term > rf.currentTerm {
 			rf.currentTerm = requestVoteArgs.Term
 			rf.votedFor = -1
@@ -509,10 +513,10 @@ func (rf *Raft) requestVoteRequestHandler(requestVoteRequest *requestVoteRequest
 		} else {
 			requestVoteReply.VoteGranted = false
 		}
-		rf.mu.Unlock()
-	}
 
+	}
 	requestVoteReply.Term = rf.currentTerm
+	rf.mu.Unlock()
 
 	notifyChan <- 1
 }
@@ -547,7 +551,16 @@ func (rf *Raft) leaderRoutine(taskChan chan int, server int, forTerm int) {
 	ch.closed = true
 	ch.mu.Unlock()
 
-	for _ = range taskChan {
+	for {
+		finished := false
+		select {
+		case <-taskChan:
+		default:
+			finished = true
+		}
+		if finished {
+			break
+		}
 	}
 }
 
@@ -569,7 +582,17 @@ func (rf *Raft) AppendEntriesReplyHandler(forTerm int, ch chan *AppendEntriesRep
 
 		reply = <-ch
 	}
-	for _ = range ch {
+
+	for {
+		finished := false
+		select {
+		case <-ch:
+		default:
+			finished = true
+		}
+		if finished {
+			break
+		}
 	}
 }
 
@@ -623,9 +646,19 @@ func (rf *Raft) sendRequestVoteToAll(forTerm int) {
 			}
 		}
 	}
-	for ; i < rf.serverCount-1; i++ {
-		<-ch
+
+	for {
+		finished := false
+		select {
+		case <-ch:
+		default:
+			finished = true
+		}
+		if finished {
+			break
+		}
 	}
+
 	DPrintf("%v: exit: sendRequestVoteToAll\n", rf.me)
 }
 
@@ -682,11 +715,12 @@ func (rf *Raft) sendRequestVoteToServer(ch chan *RequestVoteReply, server int, a
 	reply := RequestVoteReply{}
 	ok := rf.sendRequestVote(server, args, &reply)
 	DPrintf("%v: RequestVote to %v %v %v\n", rf.me, server, ok, reply.VoteGranted)
-	if ok {
-		ch <- &reply
-	} else {
-		ch <- &RequestVoteReply{-1, false}
+	if !ok {
+		reply.Term = -1
+		reply.VoteGranted = false
 	}
+	ch <- &reply
+
 }
 
 func (rf *Raft) sendAppendEntriesToServer(ch *AERChannelWithMutex, server int, args *AppendEntriesArgs, forTerm int) {
