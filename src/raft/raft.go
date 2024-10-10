@@ -634,7 +634,7 @@ func (rf *Raft) sendRequestVoteToAll(forTerm int) {
 			if voteCount > rf.serverCount/2 {
 				rf.mu.Lock()
 				if forTerm == rf.currentTerm {
-					DPrintf("%v: become leader term: %v\n", rf.me, rf.currentTerm)
+					DPrintf("%v %v: become leader\n", rf.me, rf.currentTerm)
 					rf.currentState = Leader
 					rf.initLeaderState()
 				}
@@ -657,7 +657,6 @@ func (rf *Raft) sendRequestVoteToAll(forTerm int) {
 		}
 	}
 
-	DPrintf("%v: exit: sendRequestVoteToAll\n", rf.me)
 }
 
 // 调用时已经加锁
@@ -703,7 +702,7 @@ func (rf *Raft) heartbeatTicker(taskChannel chan int, forTerm int) {
 func (rf *Raft) sendRequestVoteToServer(ch chan *RequestVoteReply, server int, args *RequestVoteArgs) {
 	reply := RequestVoteReply{}
 	ok := rf.sendRequestVote(server, args, &reply)
-	DPrintf("%v: RequestVote to %v %v %v\n", rf.me, server, ok, reply.VoteGranted)
+	DPrintf("%v %v: RequestVote to %v %v %v\n", rf.me, args.Term, server, ok, reply.VoteGranted)
 	if !ok {
 		reply.Term = -1
 		reply.VoteGranted = false
