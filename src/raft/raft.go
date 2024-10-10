@@ -483,18 +483,17 @@ func (rf *Raft) requestVoteRequestHandler(requestVoteRequest *requestVoteRequest
 	notifyChan := requestVoteRequest.notifyChan
 	requestVoteReply := requestVoteRequest.reply
 
-	DPrintf("%v: get requestVote from %v\n", rf.me, requestVoteArgs.CandidateId)
-
 	rf.mu.Lock()
+	DPrintf("%v %v: get requestVote from %v\n", rf.me, rf.currentTerm, requestVoteArgs.CandidateId)
 	if requestVoteArgs.Term < rf.currentTerm {
 		// Reply false if term < currentTerm (§5.1)
 		requestVoteReply.VoteGranted = false
 	} else {
 		// 收到可能的候选人消息
 		rf.receive.Store(true)
+
 		// If RPC request or response contains term T > currentTerm:
 		// set currentTerm = T, convert to follower (§5.1)
-
 		if requestVoteArgs.Term > rf.currentTerm {
 			rf.currentTerm = requestVoteArgs.Term
 			rf.votedFor = -1
@@ -508,7 +507,7 @@ func (rf *Raft) requestVoteRequestHandler(requestVoteRequest *requestVoteRequest
 		if (rf.votedFor == -1 || rf.votedFor == requestVoteArgs.CandidateId) && (requestVoteArgs.LastLogTerm > lastLogEntry.Term || requestVoteArgs.LastLogTerm == lastLogEntry.Term && requestVoteArgs.LastLogIndex >= lastLogIndex-1) {
 			requestVoteReply.VoteGranted = true
 			rf.votedFor = requestVoteArgs.CandidateId
-			DPrintf("%v: agree requestVote term: %v id: %v\n", rf.me, requestVoteArgs.Term, requestVoteArgs.CandidateId)
+			DPrintf("%v %v: agree requestVote from %v\n", rf.me, rf.currentTerm, requestVoteArgs.CandidateId)
 
 		} else {
 			requestVoteReply.VoteGranted = false
@@ -521,9 +520,9 @@ func (rf *Raft) requestVoteRequestHandler(requestVoteRequest *requestVoteRequest
 	notifyChan <- 1
 }
 
-// 发送 AppendEntries
+// 发送 AppendEntries to taskChan
 func (rf *Raft) leaderRoutine(taskChan chan int, server int, forTerm int) {
-	DPrintf("%v: leaderRoutine for %v \n", rf.me, server)
+	DPrintf("%v %v: leaderRoutine for %v \n", rf.me, forTerm, server)
 	// 多处发送，用锁保护
 	ch := &AERChannelWithMutex{ch: make(chan *AppendEntriesReply), closed: false}
 	// 只接收不需要锁
@@ -533,7 +532,6 @@ func (rf *Raft) leaderRoutine(taskChan chan int, server int, forTerm int) {
 
 		// Upon election: send initial empty AppendEntries RPCs
 		// (heartbeat) to each server;
-
 		prevLogIndex := rf.nextIndex[server] - 1
 		// 复制了 Log，加锁
 		rf.mu.Lock()
@@ -569,7 +567,7 @@ func (rf *Raft) AppendEntriesReplyHandler(forTerm int, ch chan *AppendEntriesRep
 
 	for rf.currentState == Leader && !rf.killed() && forTerm == rf.currentTerm {
 
-		DPrintf("%v: Heartbeat to %v %v\n", rf.me, server, reply.Term != -1)
+		DPrintf("%v %v: Heartbeat to %v %v\n", rf.me, forTerm, server, reply.Term != -1)
 		// If RPC request or response contains term T > currentTerm:
 		// set currentTerm = T, convert to follower (§5.1)
 		rf.mu.Lock()
@@ -681,33 +679,24 @@ func (rf *Raft) initLeaderState() {
 		rf.matchIndex[i] = 0
 		rf.taskChannels[i] = make(chan int)
 		go rf.leaderRoutine(rf.taskChannels[i], i, rf.currentTerm)
+		go rf.heartbeatTicker(rf.taskChannels[i], rf.currentTerm)
 	}
-	go rf.heartbeatTicker(rf.taskChannels, rf.currentTerm)
 }
 
-func (rf *Raft) heartbeatTicker(taskChannels []chan int, forTerm int) {
+func (rf *Raft) heartbeatTicker(taskChannel chan int, forTerm int) {
 	time.Sleep(100 * time.Millisecond)
 	for rf.currentState == Leader && rf.killed() == false && rf.currentTerm == forTerm {
 
 		// repeat during idle periods to
 		// prevent election timeouts (§5.2)
-		for i := 0; i < rf.serverCount; i++ {
-			if i == rf.me {
-				continue
-			}
-			taskChannels[i] <- i
-		}
+		taskChannel <- 1
+
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// 让前面创建的 routine 退出
-	for i := 0; i < rf.serverCount; i++ {
-		if i == rf.me {
-			continue
-		}
-		taskChannels[i] <- i
-		close(taskChannels[i])
-	}
+	// 让 AppendEntriesReplyHandler routine 退出
+	taskChannel <- 1
+	close(taskChannel)
 
 }
 
