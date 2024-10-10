@@ -79,8 +79,8 @@ type Raft struct {
 	receive           atomic.Bool
 	requestVoteChan   chan *requestVoteRequest
 	voteTimerChan     chan int
-	AppendEntriesChan chan *AppendEntriesRequest
-	taskChannels      []chan int
+	appendEntriesChan chan *AppendEntriesRequest
+	sendTasks         []*Shared
 }
 
 type ServerState int
@@ -96,10 +96,32 @@ type LogEntry struct {
 	Term    int
 }
 
-type AERChannelWithMutex struct {
-	ch     chan *AppendEntriesReply
-	closed bool
-	mu     sync.Mutex
+type Shared struct {
+	mu    sync.Mutex
+	cond  *sync.Cond
+	ready bool
+}
+
+func NewShared() *Shared {
+	s := &Shared{}
+	s.cond = sync.NewCond(&s.mu)
+	return s
+}
+
+func (s *Shared) Wait() {
+	s.mu.Lock()
+	for !s.ready {
+		s.cond.Wait() // 等待条件满足
+	}
+	s.ready = false
+	s.mu.Unlock()
+}
+
+func (s *Shared) Notify() {
+	s.mu.Lock()
+	s.ready = true
+	s.cond.Signal() // 通知一个等待的 goroutine
+	s.mu.Unlock()
 }
 
 // return currentTerm and whether this server
@@ -251,7 +273,7 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	notifyChan := make(chan int)
-	rf.AppendEntriesChan <- &AppendEntriesRequest{args, notifyChan, reply}
+	rf.appendEntriesChan <- &AppendEntriesRequest{args, notifyChan, reply}
 	<-notifyChan
 }
 
@@ -278,6 +300,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (3B).
+	rf.mu.Lock()
+	term = rf.currentTerm
+	isLeader = rf.currentState == Leader
+	rf.mu.Unlock()
+
+	if isLeader {
+
+	}
 
 	return index, term, isLeader
 }
@@ -344,7 +374,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.receive.Store(true)
 	rf.requestVoteChan = make(chan *requestVoteRequest)
 	rf.voteTimerChan = make(chan int)
-	rf.AppendEntriesChan = make(chan *AppendEntriesRequest)
+	rf.appendEntriesChan = make(chan *AppendEntriesRequest)
 
 	go rf.mainLoop()
 
@@ -367,7 +397,7 @@ func (rf *Raft) mainLoop() {
 			rf.requestVoteRequestHandler(requestVoteRequest)
 
 		// Respond to RPCs from candidates and leaders
-		case appendEntriesRequest := <-rf.AppendEntriesChan:
+		case appendEntriesRequest := <-rf.appendEntriesChan:
 			rf.appendEntriesRequestHandler(appendEntriesRequest)
 
 		// If election timeout elapses without receiving AppendEntries
@@ -402,7 +432,7 @@ func (rf *Raft) mainLoop() {
 		case requestVoteRequest := <-rf.requestVoteChan:
 			requestVoteRequest.notifyChan <- 1
 
-		case appendEntriesRequest := <-rf.AppendEntriesChan:
+		case appendEntriesRequest := <-rf.appendEntriesChan:
 			appendEntriesRequest.notifyChan <- 1
 
 		case <-rf.voteTimerChan:
@@ -519,7 +549,7 @@ func (rf *Raft) requestVoteRequestHandler(requestVoteRequest *requestVoteRequest
 }
 
 // 创建 appendEntriesToServer 发送 appendEntries
-func (rf *Raft) sendAppendEntriesRoutine(taskChan chan int, server int, forTerm int) {
+func (rf *Raft) sendAppendEntriesRoutine(cond *Shared, server int, forTerm int) {
 	DPrintf("%v %v: sendAppendEntriesRoutine for %v \n", rf.me, forTerm, server)
 
 	for rf.currentState == Leader && !rf.killed() && forTerm == rf.currentTerm {
@@ -532,13 +562,25 @@ func (rf *Raft) sendAppendEntriesRoutine(taskChan chan int, server int, forTerm 
 		args := AppendEntriesArgs{rf.currentTerm, rf.me, prevLogIndex, rf.log[prevLogIndex].Term, rf.log[prevLogIndex+1:], rf.commitIndex}
 		rf.mu.Unlock()
 
-		go rf.appendEntriesToServer(server, &args, forTerm)
+		reply := AppendEntriesReply{}
+		ok := rf.sendAppendEntries(server, &args, &reply)
+		DPrintf("%v: send AppendEntries to %v %v\n", rf.me, server, ok)
 
-		<-taskChan
+		if ok {
+			// If RPC request or response contains term T > currentTerm:
+			// set currentTerm = T, convert to follower (§5.1)
+			rf.mu.Lock()
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				rf.currentState = Follower
+			}
+
+			rf.mu.Unlock()
+		}
+
+		cond.Wait()
 	}
 
-	for _ = range taskChan {
-	}
 }
 
 func (rf *Raft) sendRequestVoteToAll(forTerm int) {
@@ -593,7 +635,7 @@ func (rf *Raft) sendRequestVoteToAll(forTerm int) {
 func (rf *Raft) initLeaderState() {
 	rf.nextIndex = make([]int, rf.serverCount)
 	rf.matchIndex = make([]int, rf.serverCount)
-	rf.taskChannels = make([]chan int, rf.serverCount)
+	rf.sendTasks = make([]*Shared, rf.serverCount)
 	for i := 0; i < rf.serverCount; i++ {
 		if i == rf.me {
 			continue
@@ -606,28 +648,27 @@ func (rf *Raft) initLeaderState() {
 		// known to be replicated on server
 		// (initialized to 0, increases monotonically)
 		rf.matchIndex[i] = 0
-		rf.taskChannels[i] = make(chan int)
+		rf.sendTasks[i] = NewShared()
 		// 接收方
-		go rf.sendAppendEntriesRoutine(rf.taskChannels[i], i, rf.currentTerm)
+		go rf.sendAppendEntriesRoutine(rf.sendTasks[i], i, rf.currentTerm)
 		// 发送方
-		go rf.heartbeatTicker(rf.taskChannels[i], rf.currentTerm)
+		go rf.heartbeatTicker(rf.sendTasks[i], rf.currentTerm)
 	}
 }
 
-func (rf *Raft) heartbeatTicker(taskChannel chan int, forTerm int) {
+func (rf *Raft) heartbeatTicker(cond *Shared, forTerm int) {
 	time.Sleep(100 * time.Millisecond)
 	for rf.currentState == Leader && rf.killed() == false && rf.currentTerm == forTerm {
 
 		// repeat during idle periods to
 		// prevent election timeouts (§5.2)
-		taskChannel <- 1
+		cond.Notify()
 
 		time.Sleep(100 * time.Millisecond)
 	}
 
 	// 让 sendAppendEntriesRoutine routine 退出
-	taskChannel <- 1
-	close(taskChannel)
+	cond.Notify()
 
 }
 
@@ -640,26 +681,6 @@ func (rf *Raft) sendRequestVoteToServer(ch chan *RequestVoteReply, server int, a
 		reply.VoteGranted = false
 	}
 	ch <- &reply
-
-}
-
-// 与 RequestVote 不同，在同一个 routine 中处理
-func (rf *Raft) appendEntriesToServer(server int, args *AppendEntriesArgs, forTerm int) {
-	reply := AppendEntriesReply{}
-	ok := rf.sendAppendEntries(server, args, &reply)
-	DPrintf("%v: send AppendEntries to %v %v\n", rf.me, server, ok)
-
-	if ok {
-		// If RPC request or response contains term T > currentTerm:
-		// set currentTerm = T, convert to follower (§5.1)
-		rf.mu.Lock()
-		if reply.Term > rf.currentTerm {
-			rf.currentTerm = reply.Term
-			rf.currentState = Follower
-		}
-
-		rf.mu.Unlock()
-	}
 
 }
 
