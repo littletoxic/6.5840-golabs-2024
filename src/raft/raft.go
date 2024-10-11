@@ -342,8 +342,9 @@ type AppendEntriesReply struct {
 	Success bool
 
 	// 加速日志恢复
-	XTerm int
-	XLen  int
+	XTerm  int
+	XIndex int
+	XLen   int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -385,7 +386,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					reply.XTerm = -1
 					reply.XLen = args.PrevLogIndex - len(rf.log) + 1
 				} else {
-					reply.XTerm = rf.log[args.PrevLogIndex].Term
+					// 一次回退 follower 的一整个 term
+					index := args.PrevLogIndex
+					term := rf.log[index].Term
+					reply.XTerm = rf.log[index].Term
+					for rf.log[index].Term == term {
+						index--
+					}
+					reply.XIndex = index + 1
 				}
 
 			} else {
@@ -624,12 +632,8 @@ func (rf *Raft) sendAppendEntriesRoutine(cond *DelayNotifier, server int, forTer
 						if reply.XTerm == -1 {
 							rf.nextIndex[server] -= reply.XLen
 						} else {
-							index := rf.nextIndex[server] - 1
-							index--
-							for rf.log[index].Term > reply.XTerm {
-								index--
-							}
-							rf.nextIndex[server] = index + 1
+							// 大力出奇迹，一次回退 follower 的一整个 term
+							rf.nextIndex[server] = reply.XIndex
 						}
 					}
 
