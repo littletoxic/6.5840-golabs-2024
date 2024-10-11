@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	//	"bytes"
 	"math/rand"
 	"sort"
@@ -178,6 +180,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -198,6 +208,21 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var logEntries []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&logEntries) != nil {
+		DPrintf("readPersist fail %v\n", rf.me)
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = logEntries
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -262,6 +287,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		} else {
 			reply.VoteGranted = false
 		}
+		rf.persist()
 
 	}
 	reply.Term = rf.currentTerm
@@ -331,8 +357,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.cleanup()
 			}
 			rf.currentTerm = args.Term
-			// 该 term 有 Leader 了，不需要下面一行
-			// rf.votedFor = -1
+
+			rf.votedFor = -1
 			rf.currentState = Follower
 		}
 
@@ -353,22 +379,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				// but different terms), delete the existing entry and all that
 				// follow it (§5.3)
 				// Append any new entries not already in the log
-
 				rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 
-				// todo: persistence
+				// If leaderCommit > commitIndex, set commitIndex =
+				// min(leaderCommit, index of last new entry)
+				// 在成功更新 log 后改变 commitIndex
+				if args.LeaderCommit > rf.commitIndex {
+					rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+
+					rf.commitChanged.Broadcast()
+				}
 
 				reply.Success = true
 			}
-		}
 
-		// If leaderCommit > commitIndex, set commitIndex =
-		// min(leaderCommit, index of last new entry)
-		if args.LeaderCommit > rf.commitIndex {
-			rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
-
-			rf.commitChanged.Broadcast()
 		}
+		rf.persist()
 
 	}
 	reply.Term = rf.currentTerm
@@ -416,7 +442,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.nextIndex[rf.me]++
 		rf.matchIndex[rf.me]++
 
-		DPrintf("%v %v: command appear in %v\n", rf.me, rf.currentTerm, index)
+		rf.persist()
+
+		DPrintf("%v %v: command %v appear in %v\n", rf.me, rf.currentTerm, command, index)
 
 	}
 	rf.mu.Unlock()
@@ -454,24 +482,17 @@ func (rf *Raft) ticker() {
 		rf.mu.Lock()
 
 		if !rf.killed() && rf.currentState != Leader && !rf.receive {
-			// On conversion to candidate, start election:
-			//	• Increment currentTerm
-			//	• Vote for self
-			//	• Reset election timer
-			//	• Send RequestVote RPCs to all other servers
-			rf.currentState = Candidate
-			rf.currentTerm++
-			rf.votedFor = rf.me
-			savedTerm := rf.currentTerm
+
 			DPrintf("%v %v: timeout\n", rf.me, rf.currentTerm)
-			go rf.sendRequestVoteToAll(savedTerm)
+			go rf.sendRequestVoteToAll(rf.currentTerm)
+
 		}
 		rf.receive = false
 		rf.mu.Unlock()
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 500 + (rand.Int63() % 250)
+		ms := 400 + (rand.Int63() % 400)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -553,8 +574,10 @@ func (rf *Raft) sendAppendEntriesRoutine(cond *DelayNotifier, server int, forTer
 							rf.cleanup()
 						}
 						rf.currentTerm = reply.Term
+						rf.votedFor = -1
 						rf.currentState = Follower
 						rf.mu.Unlock()
+						rf.persist()
 						break
 					}
 					DPrintf("%v %v: send AppendEntries to %v %v\n", rf.me, args.Term, server, reply.Success)
@@ -569,10 +592,10 @@ func (rf *Raft) sendAppendEntriesRoutine(cond *DelayNotifier, server int, forTer
 						// If there exists an N such that N > commitIndex, a majority
 						// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
 						// set commitIndex = N (§5.3, §5.4).
-						m := median(rf.matchIndex)
-						if m > rf.commitIndex {
-							rf.commitIndex = m
-							DPrintf("%v %v: committChanged to %v \n", rf.me, args.Term, m)
+						n := median(rf.matchIndex)
+						if n > rf.commitIndex && rf.log[n].Term == rf.currentTerm {
+							rf.commitIndex = n
+							DPrintf("%v %v: commitChanged to %v \n", rf.me, args.Term, n)
 
 							rf.commitChanged.Broadcast()
 						}
@@ -602,6 +625,22 @@ func (rf *Raft) sendRequestVoteToAll(forTerm int) {
 	ch := make(chan *RequestVoteReply)
 
 	rf.mu.Lock()
+	if rf.currentTerm != forTerm {
+		rf.mu.Unlock()
+		return
+	}
+	// On conversion to candidate, start election:
+	//	• Increment currentTerm
+	//	• Vote for self
+	//	• Reset election timer
+	//	• Send RequestVote RPCs to all other servers
+	rf.currentState = Candidate
+	rf.currentTerm++
+	rf.votedFor = rf.me
+	rf.receive = true
+	forTerm = rf.currentTerm
+	rf.persist()
+
 	logLen := len(rf.log)
 	args := &RequestVoteArgs{forTerm, rf.me, logLen - 1, rf.log[logLen-1].Term}
 	rf.mu.Unlock()
@@ -624,7 +663,9 @@ func (rf *Raft) sendRequestVoteToAll(forTerm int) {
 				rf.cleanup()
 			}
 			rf.currentTerm = reply.Term
+			rf.votedFor = -1
 			rf.currentState = Follower
+			rf.persist()
 		}
 
 		if reply.VoteGranted {
@@ -699,7 +740,9 @@ func (rf *Raft) sendHeartbeat(server int) {
 				rf.cleanup()
 			}
 			rf.currentTerm = reply.Term
+			rf.votedFor = -1
 			rf.currentState = Follower
+			rf.persist()
 		}
 
 		rf.mu.Unlock()
