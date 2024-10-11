@@ -222,6 +222,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = logEntries
+		DPrintf("%v %v: readPersist success\n", rf.me, currentTerm)
 	}
 }
 
@@ -339,6 +340,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	// 加速日志恢复
+	XTerm int
+	XLen  int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -374,6 +379,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			// whose term matches prevLogTerm (§5.3)
 			if args.PrevLogIndex >= len(rf.log) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 				reply.Success = false
+
+				// PrevLogIndex 位置没有 entry
+				if args.PrevLogIndex >= len(rf.log) {
+					reply.XTerm = -1
+					reply.XLen = args.PrevLogIndex - len(rf.log) + 1
+				} else {
+					reply.XTerm = rf.log[args.PrevLogIndex].Term
+				}
+
 			} else {
 				// If an existing entry conflicts with a new one (same index
 				// but different terms), delete the existing entry and all that
@@ -492,7 +506,7 @@ func (rf *Raft) ticker() {
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 400 + (rand.Int63() % 400)
+		ms := 350 + (rand.Int63() % 350)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -580,7 +594,7 @@ func (rf *Raft) sendAppendEntriesRoutine(cond *DelayNotifier, server int, forTer
 						rf.persist()
 						break
 					}
-					DPrintf("%v %v: send AppendEntries to %v %v\n", rf.me, args.Term, server, reply.Success)
+					DPrintf("%v %v: send AppendEntries[%v - %v] to %v %v\n", rf.me, args.Term, nextIndex-1, lastLog, server, reply.Success)
 
 					// If successful: update nextIndex and matchIndex for
 					// follower (§5.3)
@@ -605,7 +619,18 @@ func (rf *Raft) sendAppendEntriesRoutine(cond *DelayNotifier, server int, forTer
 					} else {
 						// If AppendEntries fails because of log inconsistency:
 						// decrement nextIndex and retry (§5.3)
-						rf.nextIndex[server]--
+						// 快速恢复
+
+						if reply.XTerm == -1 {
+							rf.nextIndex[server] -= reply.XLen
+						} else {
+							index := rf.nextIndex[server] - 1
+							index--
+							for rf.log[index].Term > reply.XTerm {
+								index--
+							}
+							rf.nextIndex[server] = index + 1
+						}
 					}
 
 					rf.mu.Unlock()
@@ -755,8 +780,6 @@ func (rf *Raft) sendRequestVoteToServer(ch chan *RequestVoteReply, server int, a
 	if !ok {
 		reply.Term = -1
 		reply.VoteGranted = false
-	} else {
-		DPrintf("%v %v: RequestVote to %v %v %v\n", rf.me, args.Term, server, ok, reply.VoteGranted)
 	}
 	ch <- &reply
 
