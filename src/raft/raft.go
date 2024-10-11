@@ -381,18 +381,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				// Append any new entries not already in the log
 				rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 
-				// If leaderCommit > commitIndex, set commitIndex =
-				// min(leaderCommit, index of last new entry)
-				// 在成功更新 log 后改变 commitIndex
-				if args.LeaderCommit > rf.commitIndex {
-					rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
-
-					rf.commitChanged.Broadcast()
-				}
-
 				reply.Success = true
 			}
 
+		}
+
+		// If leaderCommit > commitIndex, set commitIndex =
+		// min(leaderCommit, index of last new entry)
+		// LeaderCommit 设置为 min(matchIndex[i], commitIndex)
+		if args.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+
+			rf.commitChanged.Broadcast()
 		}
 		rf.persist()
 
@@ -555,7 +555,7 @@ func (rf *Raft) sendAppendEntriesRoutine(cond *DelayNotifier, server int, forTer
 			var args AppendEntriesArgs
 			reply := AppendEntriesReply{}
 
-			args = AppendEntriesArgs{forTerm, rf.me, nextIndex - 1, rf.log[nextIndex-1].Term, rf.log[nextIndex:], rf.commitIndex}
+			args = AppendEntriesArgs{forTerm, rf.me, nextIndex - 1, rf.log[nextIndex-1].Term, rf.log[nextIndex:], min(rf.commitIndex, rf.matchIndex[server])}
 
 			rf.mu.Unlock()
 
@@ -725,7 +725,7 @@ func (rf *Raft) heartbeatTicker(forTerm int, server int) {
 func (rf *Raft) sendHeartbeat(server int) {
 	rf.mu.Lock()
 	// 心跳时不关心别的字段
-	args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, LeaderCommit: rf.commitIndex}
+	args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, LeaderCommit: min(rf.commitIndex, rf.matchIndex[server])}
 	rf.mu.Unlock()
 
 	reply := AppendEntriesReply{}
