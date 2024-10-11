@@ -77,12 +77,18 @@ type Raft struct {
 	matchIndex []int
 
 	// other
-	serverCount   int
-	currentState  ServerState
-	receive       bool
-	sendNotifiers []*DelayNotifier
-	commitChanged *Broadcaster
-	applyCh       chan ApplyMsg
+	serverCount      int
+	currentState     ServerState
+	receive          bool
+	sendNotifiers    []*DelayNotifier
+	commitChanged    *Broadcaster
+	applyCh          chan ApplyMsg
+	snapshotNotifier *DelayNotifier
+
+	// snapshot persistent
+	firstIndex       int // 不使用 lastIncludedIndex，现在认为计算更方便
+	lastIncludedTerm int
+	snapshot         []byte
 }
 
 type ServerState int
@@ -185,13 +191,15 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
+	e.Encode(rf.firstIndex)
+	e.Encode(rf.lastIncludedTerm)
 	e.Encode(rf.log)
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	rf.persister.Save(raftstate, rf.snapshot)
 }
 
 // restore previously persisted state.
-func (rf *Raft) readPersist(data []byte) {
+func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -213,15 +221,23 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var currentTerm int
 	var votedFor int
+	var firstIndex int
+	var lastIncludedTerm int
 	var logEntries []LogEntry
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
+		d.Decode(&firstIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil ||
 		d.Decode(&logEntries) != nil {
 		DPrintf("readPersist fail %v\n", rf.me)
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
+		rf.firstIndex = firstIndex
+		rf.lastIncludedTerm = lastIncludedTerm
 		rf.log = logEntries
+
+		rf.snapshot = snapshot
 		DPrintf("%v %v: readPersist success\n", rf.me, currentTerm)
 	}
 }
@@ -232,6 +248,15 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
+	rf.mu.Lock()
+
+	rf.snapshot = snapshot
+	rf.lastIncludedTerm = rf.log[index-rf.firstIndex].Term
+	rf.log = rf.log[index-rf.firstIndex+1:]
+	rf.firstIndex = index + 1
+	rf.persist()
+
+	rf.mu.Unlock()
 
 }
 
@@ -428,6 +453,76 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+type InstallSnapshotArgs struct {
+	// 3D
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Offset            int
+	Data              []byte
+	Done              bool
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	if args.Term < rf.currentTerm {
+		// Reply immediately if term < currentTerm
+	} else {
+		rf.receive = true
+
+		// If RPC request or response contains term T > currentTerm:
+		// set currentTerm = T, convert to follower (§5.1)
+		if args.Term > rf.currentTerm {
+			if rf.currentState == Leader {
+				rf.cleanup()
+			}
+			rf.currentTerm = args.Term
+
+			rf.votedFor = -1
+			rf.currentState = Follower
+		}
+
+		// Create new snapshot file if first chunk (offset is 0)
+		// Write data into snapshot file at given offset
+		// Reply and wait for more data chunks if done is false
+		// 假设一次发完，也就是 Done 一定为 true
+		// Save snapshot file, discard any existing or partial snapshot
+		// with a smaller index
+		// 在这里是 rf.persist()
+		rf.snapshot = args.Data
+		rf.lastIncludedTerm = args.LastIncludedTerm
+		// If existing log entry has same index and term as snapshot’s
+		// last included entry, retain log entries following it and reply
+		start := args.LastIncludedIndex - rf.firstIndex + 1
+		if start >= len(rf.log) {
+			start = len(rf.log)
+		} else {
+			if rf.log[start-1].Term != args.LastIncludedTerm {
+				start = len(rf.log)
+			}
+		}
+		rf.log = rf.log[start:]
+		rf.firstIndex = args.LastIncludedIndex + 1
+		rf.persist()
+
+		// Reset state machine using snapshot contents (and load
+		// snapshot’s cluster configuration)
+		rf.snapshotNotifier.Notify()
+
+	}
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -488,6 +583,7 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 	rf.cleanup()
 	rf.commitChanged.Broadcast()
+	rf.snapshotNotifier.Notify()
 }
 
 func (rf *Raft) killed() bool {
@@ -551,14 +647,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 	rf.commitChanged = NewBroadcaster()
 	rf.applyCh = applyCh
+	rf.snapshotNotifier = NewDelayNotifier()
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	rf.readPersist(persister.ReadRaftState(), persister.ReadSnapshot())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
-	go rf.applyRoutine()
+	go rf.applyCommitRoutine()
+	go rf.applySnapshotRoutine()
 
 	return rf
 }
@@ -800,18 +898,31 @@ func (rf *Raft) cleanup() {
 
 }
 
-func (rf *Raft) applyRoutine() {
+func (rf *Raft) applyCommitRoutine() {
 	rf.commitChanged.Wait()
 	for rf.killed() == false {
 		i := rf.lastApplied + 1
 		for ; i <= rf.commitIndex && !rf.killed(); i++ {
-
+			rf.mu.Lock()
 			apply := ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i}
+			rf.mu.Unlock()
 			rf.applyCh <- apply
 		}
 		rf.lastApplied = i - 1
 
 		rf.commitChanged.Wait()
+	}
+}
+
+func (rf *Raft) applySnapshotRoutine() {
+	rf.snapshotNotifier.Wait()
+	for rf.killed() == false {
+		rf.mu.Lock()
+		apply := ApplyMsg{SnapshotValid: true, Snapshot: rf.snapshot, SnapshotTerm: rf.lastIncludedTerm, SnapshotIndex: rf.firstIndex - 1}
+		rf.mu.Unlock()
+		rf.applyCh <- apply
+
+		rf.snapshotNotifier.Wait()
 	}
 }
 
