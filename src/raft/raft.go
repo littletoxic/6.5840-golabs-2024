@@ -580,7 +580,6 @@ func (rf *Raft) sendAppendEntriesRoutine(cond *DelayNotifier, server int, forTer
 						// If AppendEntries fails because of log inconsistency:
 						// decrement nextIndex and retry (§5.3)
 						// 快速恢复
-
 						if reply.XTerm == -1 {
 							rf.nextIndex[server] -= reply.XLen
 						} else {
@@ -591,6 +590,8 @@ func (rf *Raft) sendAppendEntriesRoutine(cond *DelayNotifier, server int, forTer
 
 					rf.mu.Unlock()
 				}
+			} else {
+				break
 			}
 		}
 
