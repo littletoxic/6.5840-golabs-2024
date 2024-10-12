@@ -81,7 +81,7 @@ type Raft struct {
 	currentState  ServerState
 	receive       bool
 	sendNotifiers []*DelayNotifier
-	commitChanged *Broadcaster
+	commitChanged *DelayNotifier
 	applyCh       chan ApplyMsg
 }
 
@@ -126,29 +126,6 @@ func (s *DelayNotifier) Notify() {
 	s.mu.Unlock()
 }
 
-type Broadcaster struct {
-	mu   sync.Mutex
-	cond *sync.Cond
-}
-
-func NewBroadcaster() *Broadcaster {
-	s := &Broadcaster{}
-	s.cond = sync.NewCond(&s.mu)
-	return s
-}
-
-func (s *Broadcaster) Wait() {
-	s.mu.Lock()
-	s.cond.Wait()
-	s.mu.Unlock()
-}
-
-func (s *Broadcaster) Broadcast() {
-	s.mu.Lock()
-	s.cond.Broadcast()
-	s.mu.Unlock()
-}
-
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -181,6 +158,7 @@ func (rf *Raft) persist() {
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
 
+	// 假设调用时已经加锁
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
@@ -209,6 +187,7 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.yyy = yyy
 	// }
 
+	// 初始化时不用加锁
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var currentTerm int
@@ -395,7 +374,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if args.LeaderCommit > rf.commitIndex {
 			rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 
-			rf.commitChanged.Broadcast()
+			rf.commitChanged.Notify()
 		}
 		rf.persist()
 
@@ -468,7 +447,7 @@ func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
 	rf.cleanup()
-	rf.commitChanged.Broadcast()
+	rf.commitChanged.Notify()
 }
 
 func (rf *Raft) killed() bool {
@@ -530,7 +509,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		}
 		rf.sendNotifiers[i] = NewDelayNotifier()
 	}
-	rf.commitChanged = NewBroadcaster()
+	rf.commitChanged = NewDelayNotifier()
 	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
@@ -592,7 +571,7 @@ func (rf *Raft) sendAppendEntriesRoutine(cond *DelayNotifier, server int, forTer
 							rf.commitIndex = n
 							DPrintf("%v %v: commitChanged to %v \n", rf.me, args.Term, n)
 
-							rf.commitChanged.Broadcast()
+							rf.commitChanged.Notify()
 						}
 
 						rf.mu.Unlock()
