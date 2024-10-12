@@ -219,7 +219,11 @@ func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 		rf.lastIncludedTerm = lastIncludedTerm
 		rf.log = logEntries
 
-		rf.snapshot = snapshot
+		if snapshot == nil || len(snapshot) < 1 {
+			rf.snapshot = nil
+		} else {
+			rf.snapshot = snapshot
+		}
 
 		// 读取 snapshot 后要改变
 		rf.lastApplied = rf.firstIndex
@@ -898,7 +902,7 @@ func (rf *Raft) applyRoutine() {
 		for rf.commitIndex > rf.lastApplied && !rf.killed() {
 			rf.mu.Lock()
 			// 假设 leader 不用将 snapshot 发送到 applyCh
-			DPrintf("%v %v %v\n", rf.lastApplied, rf.firstIndex, rf.snapshot == nil)
+			// DPrintf("%v %v %v\n", rf.lastApplied, rf.firstIndex, rf.snapshot == nil)
 			if rf.lastApplied-rf.firstIndex == 0 && rf.snapshot != nil {
 				msg := ApplyMsg{SnapshotValid: true, Snapshot: rf.snapshot, SnapshotTerm: rf.lastIncludedTerm, SnapshotIndex: rf.firstIndex}
 				rf.mu.Unlock()
