@@ -265,16 +265,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// 收到可能的候选人消息
 		rf.receive = true
 
-		// If RPC request or response contains term T > currentTerm:
-		// set currentTerm = T, convert to follower (§5.1)
-		if args.Term > rf.currentTerm {
-			if rf.currentState == Leader {
-				rf.cleanup()
-			}
-			rf.currentTerm = args.Term
-			rf.votedFor = -1
-			rf.currentState = Follower
-		}
+		rf.requestPreprocess(args.Term)
 
 		lastLogIndex := len(rf.log) - 1
 		lastLogEntry := rf.log[lastLogIndex]
@@ -356,17 +347,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// 一个 term 只有一个 Leader
 		rf.receive = true
 
-		// If RPC request or response contains term T > currentTerm:
-		// set currentTerm = T, convert to follower (§5.1)
-		if args.Term > rf.currentTerm {
-			if rf.currentState == Leader {
-				rf.cleanup()
-			}
-			rf.currentTerm = args.Term
-
-			rf.votedFor = -1
-			rf.currentState = Follower
-		}
+		rf.requestPreprocess(args.Term)
 
 		// If AppendEntries RPC received from new leader: convert to
 		// follower
@@ -588,18 +569,10 @@ func (rf *Raft) sendAppendEntriesRoutine(cond *DelayNotifier, server int, forTer
 
 				if ok {
 
-					// If RPC request or response contains term T > currentTerm:
-					// set currentTerm = T, convert to follower (§5.1)
 					rf.mu.Lock()
+					rf.responsePreprocess(reply.Term)
 					if reply.Term > rf.currentTerm {
-						if rf.currentState == Leader {
-							rf.cleanup()
-						}
-						rf.currentTerm = reply.Term
-						rf.votedFor = -1
-						rf.currentState = Follower
 						rf.mu.Unlock()
-						rf.persist()
 						break
 					}
 					DPrintf("%v %v: send AppendEntries[%v - %v] to %v %v\n", rf.me, args.Term, nextIndex-1, lastLog, server, reply.Success)
@@ -684,18 +657,9 @@ func (rf *Raft) sendRequestVoteToAll(forTerm int) {
 	// 处理所有 RequestVote 的回复
 	for i := 0; i < rf.serverCount-1; i++ {
 		reply := <-ch
-		// If RPC request or response contains term T > currentTerm:
-		// set currentTerm = T, convert to follower (§5.1)
+
 		rf.mu.Lock()
-		if reply.Term > rf.currentTerm {
-			if rf.currentState == Leader {
-				rf.cleanup()
-			}
-			rf.currentTerm = reply.Term
-			rf.votedFor = -1
-			rf.currentState = Follower
-			rf.persist()
-		}
+		rf.responsePreprocess(reply.Term)
 
 		if reply.VoteGranted {
 			voteCount++
@@ -761,18 +725,9 @@ func (rf *Raft) sendHeartbeat(server int) {
 	ok := rf.sendAppendEntries(server, &args, &reply)
 
 	if ok {
-		// If RPC request or response contains term T > currentTerm:
-		// set currentTerm = T, convert to follower (§5.1)
+
 		rf.mu.Lock()
-		if reply.Term > rf.currentTerm {
-			if rf.currentState == Leader {
-				rf.cleanup()
-			}
-			rf.currentTerm = reply.Term
-			rf.votedFor = -1
-			rf.currentState = Follower
-			rf.persist()
-		}
+		rf.responsePreprocess(reply.Term)
 
 		rf.mu.Unlock()
 	}
@@ -812,6 +767,36 @@ func (rf *Raft) applyRoutine() {
 		rf.lastApplied = i - 1
 
 		rf.commitChanged.Wait()
+	}
+}
+
+// 假定调用时持有锁
+func (rf *Raft) requestPreprocess(argTerm int) {
+	// If RPC request or response contains term T > currentTerm:
+	// set currentTerm = T, convert to follower (§5.1)
+	if argTerm > rf.currentTerm {
+		if rf.currentState == Leader {
+			rf.cleanup()
+		}
+		rf.currentTerm = argTerm
+		rf.votedFor = -1
+		rf.currentState = Follower
+		rf.persist()
+	}
+}
+
+// 假定调用时持有锁
+func (rf *Raft) responsePreprocess(replyTerm int) {
+	// If RPC request or response contains term T > currentTerm:
+	// set currentTerm = T, convert to follower (§5.1)
+	if replyTerm > rf.currentTerm {
+		if rf.currentState == Leader {
+			rf.cleanup()
+		}
+		rf.currentTerm = replyTerm
+		rf.votedFor = -1
+		rf.currentState = Follower
+		rf.persist()
 	}
 }
 
