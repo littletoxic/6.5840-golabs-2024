@@ -169,9 +169,12 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
+	e.Encode(rf.firstIndex)
+	e.Encode(rf.lastIncludedTerm)
 	e.Encode(rf.log)
+
 	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
+	rf.persister.Save(raftstate, rf.snapshot)
 }
 
 // restore previously persisted state.
@@ -198,14 +201,20 @@ func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 	d := labgob.NewDecoder(r)
 	var currentTerm int
 	var votedFor int
+	var firstIndex int
+	var lastIncludedTerm int
 	var logEntries []LogEntry
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
+		d.Decode(&firstIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil ||
 		d.Decode(&logEntries) != nil {
 		DPrintf("readPersist fail %v\n", rf.me)
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
+		rf.firstIndex = firstIndex
+		rf.lastIncludedTerm = lastIncludedTerm
 		rf.log = logEntries
 		DPrintf("%v %v: readPersist success\n", rf.me, currentTerm)
 	}
@@ -846,16 +855,15 @@ func (rf *Raft) cleanup() {
 func (rf *Raft) applyRoutine() {
 	rf.commitChanged.Wait()
 	for rf.killed() == false {
-		i := rf.lastApplied + 1
 		// If commitIndex > lastApplied: increment lastApplied, apply
 		// log[lastApplied] to state machine (§5.3)
-		for ; i <= rf.commitIndex && !rf.killed(); i++ {
-			rf.mu.Lock()
-			apply := ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i}
-			rf.mu.Unlock()
+		rf.mu.Lock()
+		for rf.commitIndex > rf.lastApplied && !rf.killed() {
+			rf.lastApplied++
+			apply := ApplyMsg{CommandValid: true, Command: rf.log[rf.lastApplied-rf.firstIndex].Command, CommandIndex: rf.lastApplied}
 			rf.applyCh <- apply
 		}
-		rf.lastApplied = i - 1
+		rf.mu.Unlock()
 
 		rf.commitChanged.Wait()
 	}
