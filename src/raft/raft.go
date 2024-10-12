@@ -631,7 +631,7 @@ func (rf *Raft) sendRequestVoteToAll(forTerm int) {
 			continue
 		}
 		// 并行发送
-		go rf.sendRequestVoteToServer(ch, i, args)
+		go rf.sendRequestVoteParallel(ch, i, args)
 	}
 
 	// 处理所有 RequestVote 的回复
@@ -713,7 +713,7 @@ func (rf *Raft) sendHeartbeat(server int) {
 	}
 }
 
-func (rf *Raft) sendRequestVoteToServer(ch chan *RequestVoteReply, server int, args *RequestVoteArgs) {
+func (rf *Raft) sendRequestVoteParallel(ch chan *RequestVoteReply, server int, args *RequestVoteArgs) {
 	reply := RequestVoteReply{}
 	ok := rf.sendRequestVote(server, args, &reply)
 	if !ok {
@@ -740,8 +740,9 @@ func (rf *Raft) applyRoutine() {
 	for rf.killed() == false {
 		i := rf.lastApplied + 1
 		for ; i <= rf.commitIndex && !rf.killed(); i++ {
-
+			rf.mu.Lock()
 			apply := ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i}
+			rf.mu.Unlock()
 			rf.applyCh <- apply
 		}
 		rf.lastApplied = i - 1
