@@ -221,7 +221,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// index 通常看作逻辑位置，对 rf.log 条目的访问用到物理位置
 	// 逻辑位置 = 物理位置 + rf.firstIndex（物理位置 0 条目的逻辑位置）
 	rf.mu.Lock()
-	DPrintf("%v %v: Snapshot from %v\n", rf.me, rf.currentTerm, index)
+	DPrintf("%v %v: Snapshot from index %v\n", rf.me, rf.currentTerm, index)
 
 	rf.snapshot = snapshot
 	rf.lastIncludedTerm = rf.log[index-rf.firstIndex].Term
@@ -410,6 +410,70 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+type InstallSnapshotArgs struct {
+	// 3D
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Offset            int
+	Data              []byte
+	Done              bool
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	for args.LastIncludedTerm > rf.lastApplied {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	rf.mu.Lock()
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm || args.LastIncludedIndex <= rf.firstIndex {
+		// Reply immediately if term < currentTerm
+		// 防止多次安装相同 snapshot
+	} else {
+		rf.receive = true
+
+		rf.requestPreprocess(args.Term)
+
+		// Create new snapshot file if first chunk (offset is 0)
+		// Write data into snapshot file at given offset
+		// Reply and wait for more data chunks if done is false
+		// 假设一次发完，也就是 Done 一定为 true
+		// Save snapshot file, discard any existing or partial snapshot
+		// with a smaller index
+		// 在这里是 rf.persist()
+		rf.snapshot = args.Data
+		rf.lastIncludedTerm = args.LastIncludedTerm
+		// If existing log entry has same index and term as snapshot’s
+		// last included entry, retain log entries following it and reply
+		if args.LastIncludedIndex <= len(rf.log)-1+rf.firstIndex && args.LastIncludedTerm == rf.log[len(rf.log)-1+rf.firstIndex].Term {
+			rf.log = rf.log[args.LastIncludedIndex-rf.firstIndex:]
+		} else {
+			// Discard the entire log
+			rf.log = []LogEntry{{Term: args.LastIncludedTerm}}
+		}
+
+		// Reset state machine using snapshot contents (and load
+		// snapshot’s cluster configuration)
+		rf.snapshotNotifier.Notify()
+		rf.lastApplied = rf.firstIndex
+
+		rf.persist()
+
+	}
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
 
