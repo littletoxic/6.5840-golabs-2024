@@ -662,6 +662,7 @@ func (rf *Raft) sendLoop(forTerm int, server int) {
 
 		rf.mu.Lock()
 		// 上一条消息已经 discard，发送 snapshot 代替
+		// 获取锁后检查再次 term
 		for rf.nextIndex[server]-1-rf.firstIndex < 0 && forTerm == rf.currentTerm {
 			reply := InstallSnapshotReply{}
 			args := InstallSnapshotArgs{forTerm, rf.me, rf.firstIndex, rf.lastIncludedTerm, rf.snapshot}
