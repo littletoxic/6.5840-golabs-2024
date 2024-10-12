@@ -859,6 +859,11 @@ func (rf *Raft) applyRoutine() {
 		// log[lastApplied] to state machine (§5.3)
 		rf.mu.Lock()
 		for rf.commitIndex > rf.lastApplied && !rf.killed() {
+
+			// 假设 leader 不用将 snapshot 发送到 applyCh
+			if rf.lastApplied-rf.firstIndex == 0 {
+				rf.applyCh <- ApplyMsg{SnapshotValid: true, Snapshot: rf.snapshot, SnapshotTerm: rf.lastIncludedTerm, SnapshotIndex: rf.firstIndex}
+			}
 			rf.lastApplied++
 			apply := ApplyMsg{CommandValid: true, Command: rf.log[rf.lastApplied-rf.firstIndex].Command, CommandIndex: rf.lastApplied}
 			rf.applyCh <- apply
