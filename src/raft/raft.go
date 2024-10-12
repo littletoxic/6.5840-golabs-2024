@@ -529,57 +529,70 @@ func (rf *Raft) sendAppendEntriesRoutine(cond *DelayNotifier, server int, forTer
 	cond.Wait()
 	for !rf.killed() && forTerm == rf.currentTerm {
 
-		for !rf.killed() && forTerm == rf.currentTerm {
+		go rf.sendLoop(forTerm, server)
+		// 最多 50 毫秒循环一次
+		time.Sleep(50 * time.Millisecond)
+		cond.Wait()
+	}
 
-			rf.mu.Lock()
-			lastLog := len(rf.log) - 1
-			nextIndex := rf.nextIndex[server]
-			var args AppendEntriesArgs
-			reply := AppendEntriesReply{}
+}
 
-			args = AppendEntriesArgs{forTerm, rf.me, nextIndex - 1, rf.log[nextIndex-1].Term, rf.log[nextIndex:], min(rf.commitIndex, rf.matchIndex[server])}
+func (rf *Raft) sendLoop(forTerm int, server int) {
+	for !rf.killed() && forTerm == rf.currentTerm {
 
-			rf.mu.Unlock()
+		rf.mu.Lock()
+		lastLog := len(rf.log) - 1
+		nextIndex := rf.nextIndex[server]
+		var args AppendEntriesArgs
+		reply := AppendEntriesReply{}
 
-			// If last log index ≥ nextIndex for a follower: send
-			// AppendEntries RPC with log entries starting at nextIndex
-			if lastLog >= nextIndex {
-				ok := rf.sendAppendEntries(server, &args, &reply)
+		args = AppendEntriesArgs{forTerm, rf.me, nextIndex - 1, rf.log[nextIndex-1].Term, rf.log[nextIndex:], min(rf.commitIndex, rf.matchIndex[server])}
 
-				if ok {
+		rf.mu.Unlock()
 
-					rf.mu.Lock()
-					rf.responsePreprocess(reply.Term)
-					if reply.Term > rf.currentTerm {
-						rf.mu.Unlock()
-						break
+		// If last log index ≥ nextIndex for a follower: send
+		// AppendEntries RPC with log entries starting at nextIndex
+		if lastLog >= nextIndex {
+			ok := rf.sendAppendEntries(server, &args, &reply)
+
+			if ok {
+
+				rf.mu.Lock()
+				rf.responsePreprocess(reply.Term)
+				if reply.Term > rf.currentTerm {
+					rf.mu.Unlock()
+					break
+				}
+				DPrintf("%v %v: send AppendEntries[%v - %v] to %v %v\n", rf.me, args.Term, nextIndex-1, lastLog, server, reply.Success)
+
+				// If successful: update nextIndex and matchIndex for
+				// follower (§5.3)
+				if reply.Success {
+
+					// 更大时更新，防止网络延迟
+					rf.nextIndex[server] = max(lastLog+1, rf.nextIndex[server])
+					rf.matchIndex[server] = max(lastLog, rf.matchIndex[server])
+
+					// 是否有更高的 committed
+					// If there exists an N such that N > commitIndex, a majority
+					// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
+					// set commitIndex = N (§5.3, §5.4).
+					n := median(rf.matchIndex)
+					if n > rf.commitIndex && rf.log[n].Term == rf.currentTerm {
+						rf.commitIndex = n
+						DPrintf("%v %v: commitChanged to %v \n", rf.me, args.Term, n)
+
+						rf.commitChanged.Notify()
 					}
-					DPrintf("%v %v: send AppendEntries[%v - %v] to %v %v\n", rf.me, args.Term, nextIndex-1, lastLog, server, reply.Success)
 
-					// If successful: update nextIndex and matchIndex for
-					// follower (§5.3)
-					if reply.Success {
-						rf.nextIndex[server] = lastLog + 1
-						rf.matchIndex[server] = lastLog
-
-						// 是否有更高的 committed
-						// If there exists an N such that N > commitIndex, a majority
-						// of matchIndex[i] ≥ N, and log[N].term == currentTerm:
-						// set commitIndex = N (§5.3, §5.4).
-						n := median(rf.matchIndex)
-						if n > rf.commitIndex && rf.log[n].Term == rf.currentTerm {
-							rf.commitIndex = n
-							DPrintf("%v %v: commitChanged to %v \n", rf.me, args.Term, n)
-
-							rf.commitChanged.Notify()
-						}
-
-						rf.mu.Unlock()
-						break
-					} else {
-						// If AppendEntries fails because of log inconsistency:
-						// decrement nextIndex and retry (§5.3)
-						// 快速恢复
+					rf.mu.Unlock()
+					break
+				} else {
+					// If AppendEntries fails because of log inconsistency:
+					// decrement nextIndex and retry (§5.3)
+					// 快速恢复
+					// nextIndex 与之前记录相等时更新，否则可能已经被更新过
+					if nextIndex == rf.nextIndex[server] {
 						if reply.XTerm == -1 {
 							rf.nextIndex[server] -= reply.XLen
 						} else {
@@ -587,17 +600,14 @@ func (rf *Raft) sendAppendEntriesRoutine(cond *DelayNotifier, server int, forTer
 							rf.nextIndex[server] = reply.XIndex
 						}
 					}
-
-					rf.mu.Unlock()
 				}
-			} else {
-				break
+
+				rf.mu.Unlock()
 			}
+		} else {
+			break
 		}
-
-		cond.Wait()
 	}
-
 }
 
 func (rf *Raft) sendRequestVoteToAll(forTerm int) {
@@ -786,6 +796,13 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func max(a, b int) int {
+	if a < b {
+		return b
+	}
+	return a
 }
 
 func median(nums []int) int {
