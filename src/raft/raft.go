@@ -254,11 +254,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
 			DPrintf("%v %v: agree requestVote from %v\n", rf.me, rf.currentTerm, args.CandidateId)
-
+			rf.persist()
 		} else {
 			reply.VoteGranted = false
 		}
-		rf.persist()
 
 	}
 	reply.Term = rf.currentTerm
@@ -362,7 +361,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				// follow it (§5.3)
 				// Append any new entries not already in the log
 				rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
-
+				rf.persist()
 				reply.Success = true
 			}
 
@@ -376,7 +375,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 			rf.commitChanged.Notify()
 		}
-		rf.persist()
 
 	}
 	reply.Term = rf.currentTerm
