@@ -219,6 +219,8 @@ func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 		rf.lastIncludedTerm = lastIncludedTerm
 		rf.log = logEntries
 
+		rf.snapshot = snapshot
+
 		// 读取 snapshot 后要改变
 		rf.lastApplied = rf.firstIndex
 		DPrintf("%v %v: readPersist success\n", rf.me, currentTerm)
@@ -896,15 +898,17 @@ func (rf *Raft) applyRoutine() {
 		for rf.commitIndex > rf.lastApplied && !rf.killed() {
 			rf.mu.Lock()
 			// 假设 leader 不用将 snapshot 发送到 applyCh
+			DPrintf("%v %v %v\n", rf.lastApplied, rf.firstIndex, rf.snapshot == nil)
 			if rf.lastApplied-rf.firstIndex == 0 && rf.snapshot != nil {
 				msg := ApplyMsg{SnapshotValid: true, Snapshot: rf.snapshot, SnapshotTerm: rf.lastIncludedTerm, SnapshotIndex: rf.firstIndex}
 				rf.mu.Unlock()
+				DPrintf("%v %v: apply snapshot at %v\n", rf.me, rf.currentTerm, msg.SnapshotIndex)
 				rf.applyCh <- msg
 				rf.mu.Lock()
 			}
 			rf.lastApplied++
 			apply := ApplyMsg{CommandValid: true, Command: rf.log[rf.lastApplied-rf.firstIndex].Command, CommandIndex: rf.lastApplied}
-			DPrintf("%v %v: apply %v at %v\n", rf.me, rf.currentTerm, apply.Command, apply.CommandIndex)
+			DPrintf("%v %v: apply %v at %v -- firstIndex: %v\n", rf.me, rf.currentTerm, apply.Command, apply.CommandIndex, rf.firstIndex)
 			rf.mu.Unlock()
 			rf.applyCh <- apply
 		}
