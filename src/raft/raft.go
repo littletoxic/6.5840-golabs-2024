@@ -218,6 +218,9 @@ func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 		rf.firstIndex = firstIndex
 		rf.lastIncludedTerm = lastIncludedTerm
 		rf.log = logEntries
+
+		// 读取 snapshot 后要改变
+		rf.lastApplied = rf.firstIndex
 		DPrintf("%v %v: readPersist success\n", rf.me, currentTerm)
 	}
 }
