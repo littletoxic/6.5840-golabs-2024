@@ -77,12 +77,18 @@ type Raft struct {
 	matchIndex []int
 
 	// other
-	serverCount   int
-	currentState  ServerState
-	receive       bool
-	sendNotifiers []*DelayNotifier
-	commitChanged *DelayNotifier
-	applyCh       chan ApplyMsg
+	serverCount      int
+	currentState     ServerState
+	receive          bool
+	sendNotifiers    []*DelayNotifier
+	commitChanged    *DelayNotifier
+	applyCh          chan ApplyMsg
+	snapshotNotifier *DelayNotifier
+
+	// snapshot persistent
+	firstIndex       int // 不使用 lastIncludedIndex，现在认为计算更方便
+	lastIncludedTerm int
+	snapshot         []byte
 }
 
 type ServerState int
@@ -169,7 +175,7 @@ func (rf *Raft) persist() {
 }
 
 // restore previously persisted state.
-func (rf *Raft) readPersist(data []byte) {
+func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -211,6 +217,19 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
+	// 保留位于 index 位置的条目，以简化逻辑
+	// index 通常看作逻辑位置，对 rf.log 条目的访问用到物理位置
+	// 逻辑位置 = 物理位置 + rf.firstIndex（物理位置 0 条目的逻辑位置）
+	rf.mu.Lock()
+	DPrintf("%v %v: Snapshot from %v\n", rf.me, rf.currentTerm, index)
+
+	rf.snapshot = snapshot
+	rf.lastIncludedTerm = rf.log[index-rf.firstIndex].Term
+	rf.log = rf.log[index-rf.firstIndex:]
+	rf.firstIndex = index
+	rf.persist()
+
+	rf.mu.Unlock()
 
 }
 
@@ -502,8 +521,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
+	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.log = []LogEntry{{}}
+	rf.log = []LogEntry{{Term: -1}}
+
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 
 	rf.serverCount = len(peers)
 	rf.currentState = Follower
@@ -517,9 +540,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 	rf.commitChanged = NewDelayNotifier()
 	rf.applyCh = applyCh
+	rf.snapshotNotifier = NewDelayNotifier()
+
+	rf.firstIndex = 0
+	rf.lastIncludedTerm = -1
+	rf.snapshot = nil
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	rf.readPersist(persister.ReadRaftState(), persister.ReadSnapshot())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
