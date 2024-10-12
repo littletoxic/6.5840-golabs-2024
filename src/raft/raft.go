@@ -349,7 +349,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					index := args.PrevLogIndex
 					term := rf.log[index].Term
 					reply.XTerm = rf.log[index].Term
-					for rf.log[index].Term == term {
+					for index >= 0 && rf.log[index].Term == term {
 						index--
 					}
 					reply.XIndex = index + 1
@@ -359,10 +359,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				// If an existing entry conflicts with a new one (same index
 				// but different terms), delete the existing entry and all that
 				// follow it (§5.3)
-				// Append any new entries not already in the log
-				rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
-				rf.persist()
-				reply.Success = true
+				// 实现成本地 Log 更短直接 append，否则判断上面的规则
+				if len(rf.log)-(args.PrevLogIndex+1) > len(args.Entries) {
+					for i := 0; i < len(args.Entries); i++ {
+						if rf.log[args.PrevLogIndex+1+i].Term != args.Entries[i].Term {
+							rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+							break
+						}
+					}
+				} else {
+					// Append any new entries not already in the log
+					rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+					rf.persist()
+					reply.Success = true
+				}
 			}
 
 		}
@@ -747,6 +757,8 @@ func (rf *Raft) applyRoutine() {
 	rf.commitChanged.Wait()
 	for rf.killed() == false {
 		i := rf.lastApplied + 1
+		// If commitIndex > lastApplied: increment lastApplied, apply
+		// log[lastApplied] to state machine (§5.3)
 		for ; i <= rf.commitIndex && !rf.killed(); i++ {
 			rf.mu.Lock()
 			apply := ApplyMsg{CommandValid: true, Command: rf.log[i].Command, CommandIndex: i}
