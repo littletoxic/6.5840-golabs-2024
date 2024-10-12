@@ -236,7 +236,6 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
-	DPrintf("%v %v: get requestVote from %v\n", rf.me, rf.currentTerm, args.CandidateId)
 	if args.Term < rf.currentTerm {
 		// Reply false if term < currentTerm (§5.1)
 		reply.VoteGranted = false
@@ -253,7 +252,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && (args.LastLogTerm > lastLogEntry.Term || (args.LastLogTerm == lastLogEntry.Term && args.LastLogIndex >= lastLogIndex)) {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
-			DPrintf("%v %v: agree requestVote from %v\n", rf.me, rf.currentTerm, args.CandidateId)
 			rf.persist()
 		} else {
 			reply.VoteGranted = false
@@ -371,8 +369,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					// Append any new entries not already in the log
 					rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 					rf.persist()
-					reply.Success = true
 				}
+				reply.Success = true
 			}
 
 		}
