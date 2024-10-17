@@ -650,8 +650,8 @@ func (rf *Raft) sendLogRoutine(cond *DelayNotifier, server int, forTerm int) {
 	for !rf.killed() && forTerm == rf.currentTerm {
 
 		go rf.sendLoop(forTerm, server)
-		// 最多 50 毫秒循环一次
-		time.Sleep(50 * time.Millisecond)
+		// 最多 5 毫秒循环一次
+		time.Sleep(5 * time.Millisecond)
 		cond.Wait()
 	}
 
