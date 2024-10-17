@@ -7,6 +7,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = false
@@ -18,11 +19,29 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	CommandType CommandType
+	Key         string
+	Value       string
+	CommiterId  int
+	ClientId    int64
+	SendCount   int64
+}
+
+type CommandType int
+
+const (
+	GET = iota
+	PUT
+	APPEND
+)
+
+type Result struct {
+	commiterId int
+	result     string
 }
 
 type KVServer struct {
@@ -35,19 +54,87 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	data         map[string]string
+	lastExecuted map[int64]int64
+	notifyChs    map[int]chan Result
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	cmd := Op{
+		CommandType: GET,
+		Key:         args.Key,
+		Value:       "",
+		CommiterId:  kv.me,
+		ClientId:    args.Id,
+		SendCount:   args.SendCount,
+	}
+	index, _, isLeader := kv.rf.Start(cmd)
+	if !isLeader {
+		// 直接返回
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// 等待提交结果
+	ch := make(chan Result)
+	kv.mu.Lock()
+	kv.notifyChs[index] = ch
+	kv.mu.Unlock()
+	result := <-ch
+	if result.commiterId == kv.me {
+		reply.Err = OK
+		reply.Value = result.result
+	} else {
+		reply.Err = ErrWrongLeader
+	}
+
+	kv.mu.Lock()
+	delete(kv.notifyChs, index)
+	kv.mu.Unlock()
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.PutAppend(args, reply, PUT)
 }
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.PutAppend(args, reply, APPEND)
+}
+
+func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply, commandType CommandType) {
+	cmd := Op{
+		CommandType: commandType,
+		Key:         args.Key,
+		Value:       args.Value,
+		CommiterId:  kv.me,
+		ClientId:    args.Id,
+		SendCount:   args.SendCount,
+	}
+	index, _, isLeader := kv.rf.Start(cmd)
+	if !isLeader {
+		// 直接返回
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	// 等待提交结果
+	ch := make(chan Result)
+	kv.mu.Lock()
+	kv.notifyChs[index] = ch
+	kv.mu.Unlock()
+	result := <-ch
+	if result.commiterId == kv.me {
+		reply.Err = OK
+	} else {
+		reply.Err = ErrWrongLeader
+	}
+
+	kv.mu.Lock()
+	delete(kv.notifyChs, index)
+	kv.mu.Unlock()
+
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -91,11 +178,76 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
+	kv.data = make(map[string]string)
+	kv.lastExecuted = make(map[int64]int64)
+	kv.notifyChs = make(map[int]chan Result)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	go kv.applyRoutine()
+	go kv.heartbeatRoutine()
 
 	return kv
+}
+
+func (kv *KVServer) applyRoutine() {
+	for !kv.killed() {
+		apply := <-kv.applyCh
+
+		if apply.CommandValid {
+			cmd := apply.Command.(Op)
+			DPrintf("%v %v\n", cmd, apply.CommandIndex)
+			result := Result{commiterId: cmd.CommiterId}
+			kv.mu.Lock()
+			ch, exist := kv.notifyChs[apply.CommandIndex]
+			kv.mu.Unlock()
+			switch cmd.CommandType {
+			case GET:
+				result.result = kv.data[cmd.Key]
+
+			case PUT:
+				if cmd.SendCount > kv.lastExecuted[cmd.ClientId] {
+					kv.lastExecuted[cmd.ClientId] = cmd.SendCount
+					kv.data[cmd.Key] = cmd.Value
+
+				}
+
+			case APPEND:
+				if cmd.SendCount > kv.lastExecuted[cmd.ClientId] {
+					kv.lastExecuted[cmd.ClientId] = cmd.SendCount
+					kv.data[cmd.Key] = kv.data[cmd.Key] + cmd.Value
+				}
+
+			}
+
+			if exist {
+				ch <- result
+			}
+
+		}
+
+		if apply.SnapshotValid {
+
+		}
+	}
+}
+
+// 应用层心跳，检查 Raft 状态是否改变
+func (kv *KVServer) heartbeatRoutine() {
+	// 最长可能选举时间
+	time.Sleep(700 * time.Millisecond)
+	for !kv.killed() {
+		cmd := Op{
+			CommandType: GET,
+			Key:         "",
+			Value:       "",
+			CommiterId:  kv.me,
+			ClientId:    -1,
+			SendCount:   0,
+		}
+		kv.rf.Start(cmd)
+		time.Sleep(700 * time.Millisecond)
+	}
 }
