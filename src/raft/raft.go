@@ -198,7 +198,6 @@ func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 	//   rf.yyy = yyy
 	// }
 
-	// 初始化时不用加锁
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var currentTerm int
@@ -213,6 +212,8 @@ func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 		d.Decode(&logEntries) != nil {
 		DPrintf("readPersist fail %v\n", rf.me)
 	} else {
+		// 重启恢复时也要加锁
+		rf.mu.Lock()
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.firstIndex = firstIndex
@@ -228,6 +229,7 @@ func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 		// 读取 snapshot 后要改变
 		rf.lastApplied = rf.firstIndex
 		DPrintf("%v %v: readPersist success\n", rf.me, currentTerm)
+		rf.mu.Unlock()
 	}
 }
 
