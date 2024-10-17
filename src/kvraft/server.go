@@ -4,6 +4,7 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -57,6 +58,10 @@ type KVServer struct {
 	data         map[string]string
 	lastExecuted map[int64]int64
 	notifyChs    map[int]chan Result
+	persister    *raft.Persister
+}
+
+type ExecutedState struct {
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -181,6 +186,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.data = make(map[string]string)
 	kv.lastExecuted = make(map[int64]int64)
 	kv.notifyChs = make(map[int]chan Result)
+	kv.persister = persister
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
@@ -226,10 +232,31 @@ func (kv *KVServer) applyRoutine() {
 				ch <- result
 			}
 
+			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
+				w := new(bytes.Buffer)
+				e := labgob.NewEncoder(w)
+				e.Encode(kv.data)
+				e.Encode(kv.lastExecuted)
+
+				snapshot := w.Bytes()
+				kv.rf.Snapshot(apply.CommandIndex, snapshot)
+			}
+
 		}
 
 		if apply.SnapshotValid {
+			r := bytes.NewBuffer(apply.Snapshot)
+			d := labgob.NewDecoder(r)
+			var data map[string]string
+			var lastExecuted map[int64]int64
+			if d.Decode(&data) != nil ||
+				d.Decode(&lastExecuted) != nil {
 
+			} else {
+				kv.data = data
+				kv.lastExecuted = lastExecuted
+
+			}
 		}
 	}
 }
