@@ -245,11 +245,15 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	DPrintf("%v %v: Snapshot from index %v\n", rf.me, rf.currentTerm, index)
 
-	rf.snapshot = snapshot
-	rf.lastIncludedTerm = rf.log[index-rf.firstIndex].Term
-	rf.log = rf.log[index-rf.firstIndex:]
-	rf.firstIndex = index
-	rf.persist()
+	// 新 snapshot 包含的 index 大于现有时更新
+	// 可能出现在 leader 发送了 snapshot 之后
+	if index > rf.firstIndex {
+		rf.snapshot = snapshot
+		rf.lastIncludedTerm = rf.log[index-rf.firstIndex].Term
+		rf.log = rf.log[index-rf.firstIndex:]
+		rf.firstIndex = index
+		rf.persist()
+	}
 
 	rf.mu.Unlock()
 
