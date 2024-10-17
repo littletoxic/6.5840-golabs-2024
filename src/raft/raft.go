@@ -84,6 +84,7 @@ type Raft struct {
 	commitChanged    *DelayNotifier
 	applyCh          chan ApplyMsg
 	snapshotNotifier *DelayNotifier
+	routerCount      []int
 
 	// snapshot persistent
 	firstIndex       int // 不使用 lastIncludedIndex，现在认为计算更方便
@@ -382,7 +383,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 			// Reply false if log doesn’t contain an entry at prevLogIndex
 			// whose term matches prevLogTerm (§5.3)
-			if args.PrevLogIndex >= len(rf.log)+rf.firstIndex || rf.log[args.PrevLogIndex-rf.firstIndex].Term != args.PrevLogTerm {
+			if args.PrevLogIndex >= len(rf.log)+rf.firstIndex || (args.PrevLogIndex-rf.firstIndex >= 0 && rf.log[args.PrevLogIndex-rf.firstIndex].Term != args.PrevLogTerm) {
 				reply.Success = false
 
 				// PrevLogIndex 位置没有 entry
@@ -405,16 +406,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				// but different terms), delete the existing entry and all that
 				// follow it (§5.3)
 				// 实现成本地 Log 更短直接 append，否则判断上面的规则
+				DPrintf("%v %v: ae %v %v %v\n", rf.me, rf.currentTerm, args, rf.log, rf.firstIndex)
 				if len(rf.log)+rf.firstIndex-(args.PrevLogIndex+1) > len(args.Entries) {
 					for i := 0; i < len(args.Entries); i++ {
-						if rf.log[args.PrevLogIndex+1+i-rf.firstIndex].Term != args.Entries[i].Term {
-							rf.log = append(rf.log[:args.PrevLogIndex+1-rf.firstIndex], args.Entries...)
+						if args.PrevLogIndex+1+i-rf.firstIndex >= 0 && rf.log[args.PrevLogIndex+1+i-rf.firstIndex].Term != args.Entries[i].Term {
+							rf.log = append(rf.log[:args.PrevLogIndex+1-rf.firstIndex+i], args.Entries[i:]...)
+							rf.persist()
 							break
 						}
 					}
 				} else {
 					// Append any new entries not already in the log
-					rf.log = append(rf.log[:args.PrevLogIndex+1-rf.firstIndex], args.Entries...)
+					i := rf.firstIndex - args.PrevLogIndex - 1
+					if i >= 0 {
+						rf.log = append(rf.log[:args.PrevLogIndex+1-rf.firstIndex+i], args.Entries[i:]...)
+					} else {
+						rf.log = append(rf.log[:args.PrevLogIndex+1-rf.firstIndex], args.Entries...)
+					}
 					rf.persist()
 				}
 				reply.Success = true
@@ -463,7 +471,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.Term < rf.currentTerm || args.LastIncludedIndex <= rf.firstIndex {
 		// Reply immediately if term < currentTerm
 		// 防止多次安装相同 snapshot
-		DPrintf("**\n")
 	} else {
 		rf.receive = true
 
@@ -655,16 +662,20 @@ func (rf *Raft) sendLogRoutine(cond *DelayNotifier, server int, forTerm int) {
 	cond.Wait()
 	for !rf.killed() && forTerm == rf.currentTerm {
 
-		go rf.sendLoop(forTerm, server)
-		// 最多 5 毫秒循环一次
-		time.Sleep(5 * time.Millisecond)
+		if rf.routerCount[server] < 5 {
+			go rf.sendLoop(forTerm, server)
+			rf.routerCount[server]++
+		}
+		// 最多 10 毫秒循环一次
+		time.Sleep(10 * time.Millisecond)
 		cond.Wait()
 	}
 
 }
 
 func (rf *Raft) sendLoop(forTerm int, server int) {
-	for !rf.killed() && forTerm == rf.currentTerm {
+	success := false
+	for !rf.killed() && !success && forTerm == rf.currentTerm {
 
 		rf.mu.Lock()
 		// 上一条消息已经 discard，发送 snapshot 代替
@@ -679,6 +690,7 @@ func (rf *Raft) sendLoop(forTerm int, server int) {
 
 			rf.mu.Lock()
 			if ok {
+				DPrintf("%v %v: send InstallSnapshot %v to %v success\n", rf.me, args.Term, args.LastIncludedIndex, server)
 				rf.responsePreprocess(reply.Term)
 				if reply.Term > rf.currentTerm || rf.currentTerm != forTerm {
 					break
@@ -716,6 +728,7 @@ func (rf *Raft) sendLoop(forTerm int, server int) {
 				// If successful: update nextIndex and matchIndex for
 				// follower (§5.3)
 				if reply.Success {
+					success = true
 
 					rf.successUpdateFollowerState(server, lastLog)
 
@@ -743,6 +756,12 @@ func (rf *Raft) sendLoop(forTerm int, server int) {
 			break
 		}
 	}
+
+	rf.mu.Lock()
+	if forTerm == rf.currentTerm {
+		rf.routerCount[server]--
+	}
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) successUpdateFollowerState(server int, lastLog int) {
@@ -827,6 +846,7 @@ func (rf *Raft) sendRequestVoteToAll(forTerm int) {
 func (rf *Raft) initLeaderState() {
 	rf.nextIndex = make([]int, rf.serverCount)
 	rf.matchIndex = make([]int, rf.serverCount)
+	rf.routerCount = make([]int, rf.serverCount)
 	rf.sendNotifiers = make([]*DelayNotifier, rf.serverCount)
 	for i := 0; i < rf.serverCount; i++ {
 		// for each server, index of the next log entry
